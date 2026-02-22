@@ -1,9 +1,15 @@
-# hnsw
+# fast-hnsw
 
 A pure-Rust, dependency-free implementation of **Hierarchical Navigable Small World** (HNSW) approximate nearest-neighbour (ANN) search.
 
 > Malkov & Yashunin, *"Efficient and robust approximate nearest neighbor search using
 > Hierarchical Navigable Small World graphs"*, IEEE TPAMI 2018.
+
+## Install
+
+```shell
+cargo add fast-hnsw
+```
 
 ---
 

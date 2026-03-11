@@ -1,6 +1,6 @@
 [package]
 name = "fast-hnsw"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Pure-Rust implementation of Hierarchical Navigable Small World (HNSW) approximate nearest-neighbour search"
 authors = ["Nataliya Kosmyna <nkosmyna@mit.edu>"]

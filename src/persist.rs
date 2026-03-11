@@ -453,6 +453,7 @@ fn read_hnsw_mmap_inner<D: Distance>(
     // Advise the OS that we will access pages in random order (ANN search
     // pattern), so it should not waste I/O bandwidth on linear read-ahead.
     // Failure is silently ignored — this is a performance hint only.
+    #[cfg(unix)]
     let _ = mmap.advise(memmap2::Advice::Random);
 
     let mut cursor = io::Cursor::new(mmap.as_ref() as &[u8]);

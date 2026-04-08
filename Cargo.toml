@@ -13,24 +13,15 @@ exclude = [
 ]
 
 [dependencies]
-rand     = { version = "0.8", features = ["small_rng"] }
+rand     = "0.10"
 memmap2  = "0.9"   # pure-Rust mmap wrapper; zero C/C++ deps
 
 [dev-dependencies]
-rand        = { version = "0.8", features = ["small_rng"] }
-hnsw_rs     = "0.3.3"
-hnsw_ext    = { package = "hnsw", version = "0.11.0" }   # rust-cv / Geordon Worley
-rand_pcg    = "0.3"                                       # RNG required by hnsw_ext
-space       = { version = "0.17", default-features = false, features = ["alloc"] } # Metric trait
+rand        = "0.10"
 
 [[bench]]
 name  = "bench"
 path  = "benches/bench.rs"
-harness = false
-
-[[bench]]
-name  = "compare"
-path  = "benches/compare.rs"
 harness = false
 
 [[bench]]

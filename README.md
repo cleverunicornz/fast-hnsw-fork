@@ -283,8 +283,8 @@ Sort the M + 1-entry list by the stored per-edge distance and truncate to M.
 
 - **Zero new distance computations** — every connection stores `(neighbour_id: u32, dist: f32)`; the distance is recorded for free at edge-add time (symmetric metric).
 - **Cost**: ~25 ns per prune — an in-register sort of M + 1 floats + a pointer update.
-- **Recall**: beats hnsw_rs at every workload; ≈ 0–1 pp lower than `Heuristic` on very high-dimensional data.
-- Equivalent to what faiss and hnsw_rs use for reverse-update pruning.
+- **Recall**: ≈ 0–1 pp lower than `Heuristic` on very high-dimensional data.
+- Equivalent to a common sort-and-truncate reverse-update prune.
 
 ### `PruneStrategy::Heuristic` (opt-in)
 
@@ -299,7 +299,6 @@ Run the full paper Algorithm 4 diversity check, exploiting stored distances to e
 use hnsw::{Builder, PruneStrategy};
 use hnsw::distance::Euclidean;
 
-// Default — fastest, beats hnsw_rs on both speed and recall:
 let fast = Builder::new()
     .prune_strategy(PruneStrategy::Simple)
     .build(Euclidean);
@@ -352,106 +351,6 @@ Every connection list stores `(neighbour_id: u32, dist_from_this_node: f32)`.  T
 2. **`PruneStrategy::Heuristic`**: the M distance recomputations that a naïve heuristic prune would need are completely eliminated — only the pairwise diversity checks remain.
 
 The storage overhead is 4 extra bytes per edge (8 bytes total vs 4 for a bare `u32`), equal to what you'd pay for an `Arc` or box pointer.
-
----
-
-## Benchmark — ours vs. `hnsw_rs v0.3.3` and `hnsw v0.11` (rust-cv)
-
-> **Setup:** M = 16 · ef\_construction = 200 · K = 10 · 500 queries · metric = L2(f32)
-> Single-threaded · release build · ground truth = brute-force exact L2.
->
-> Three libraries compared:
-> - **ours** — this repo (pure Rust, `PruneStrategy::Simple` default)
-> - **hnsw\_rs v0.3.3** — Jean-Pierre Both (Rayon + `parking_lot::RwLock`, inserts serialised)
-> - **hnsw v0.11** (rust-cv) — Geordon Worley (const-generic M/M0, external `Searcher`, owns `Vec<f32>` per item)
-
-### Optimisation journey and quality
-
-![Optimisation stages — insert speed and recall](figures/fig6_before_after.png)
-
-The deep blue bars (`Simple` default) consistently beat hnsw\_rs on insert speed.  The amber bars (`Heuristic`, opt-in) show the quality gain from full Algorithm 4 pruning at the cost of slower inserts on high-dimensional data.
-
-### Insert throughput
-
-`PruneStrategy::Simple` (the default) is **1.42–3.06× faster** than both competitors — sort+truncate of M stored floats is ~80× cheaper than hnsw\_rs's equivalent, and we clone no heap data per insert unlike hnsw v0.11.
-
-![Insert throughput — 3 libraries](figures/fig1_insert_throughput.png)
-
-### Search throughput
-
-**1.5–3.7× faster** than hnsw\_rs and **1.5–3.9× faster** than hnsw v0.11 across all workloads and ef values.  hnsw\_rs acquires a `parking_lot::RwLock` on every graph-layer access; we have zero locking overhead.
-
-![Search throughput — 3 libraries](figures/fig2_search_throughput.png)
-
-### Recall@10
-
-**+0.3 to +2.8 pp** higher recall than hnsw\_rs at every workload.  hnsw v0.11 applies full Algorithm 4 diversity pruning to *all* edges (including reverse-edge updates), giving it a quality edge at large n / high dim at the cost of 2–3× slower inserts.
-
-![Recall@10 — 3 libraries](figures/fig3_recall.png)
-
-### Recall vs. throughput tradeoff (per-library)
-
-Our curves sit to the right of hnsw\_rs's on every workload — better recall at the same QPS, or the same recall at higher QPS.
-
-![Recall vs QPS tradeoff](figures/fig4_recall_vs_qps.png)
-
-### All three libraries on one chart
-
-Colour = workload (n/dim), line style = library.  At small n every library reaches near-perfect recall; the separation grows with n and dim.
-
-![All-library recall vs QPS overlay](figures/fig7_all_tradeoff.png)
-
-### Speedup summary
-
-Rows split by competitor.  Blue = ours faster, red = ours slower.
-
-![Speedup heatmap](figures/fig5_speedup_heatmap.png)
-
-### Numerical summary
-
-**Insert throughput** (`PruneStrategy::Simple`, vectors / second)
-
-| Workload | ours | hnsw\_rs | vs rs | hnsw v0.11 | vs v0 |
-|---|---:|---:|:---:|---:|:---:|
-| n=1k,  dim=32  | 18 451 | 10 248 | **▲1.80×** | 11 452 | **▲1.61×** |
-| n=1k,  dim=128 |  8 856 |  6 069 | **▲1.46×** |  6 245 | **▲1.42×** |
-| n=10k, dim=32  |  9 612 |  3 861 | **▲2.49×** |  3 587 | **▲2.68×** |
-| n=10k, dim=128 |  3 640 |  2 030 | **▲1.79×** |  1 804 | **▲2.02×** |
-| n=50k, dim=128 |  2 241 |  1 045 | **▲2.14×** |    733 | **▲3.06×** |
-
-**Search throughput at ef=200** (queries / second)
-
-| Workload | ours | hnsw\_rs | vs rs | hnsw v0.11 | vs v0 |
-|---|---:|---:|:---:|---:|:---:|
-| n=1k,  dim=32  | 15 194 |  8 139 | **▲1.87×** |  8 537 | **▲1.78×** |
-| n=1k,  dim=128 |  8 018 |  5 192 | **▲1.54×** |  5 403 | **▲1.48×** |
-| n=10k, dim=32  |  7 999 |  2 990 | **▲2.68×** |  2 588 | **▲3.09×** |
-| n=10k, dim=128 |  3 281 |  1 561 | **▲2.10×** |  1 250 | **▲2.62×** |
-| n=50k, dim=128 |  1 836 |    864 | **▲2.12×** |    491 | **▲3.74×** |
-
-**Recall@10 at ef=200** (`PruneStrategy::Simple`)
-
-| Workload | ours | hnsw\_rs | Δ vs rs | hnsw v0.11 | Δ vs v0 |
-|---|---:|---:|:---:|---:|:---:|
-| n=1k,  dim=32  | **100.0%** | 98.6% | +1.4 pp | 98.7% | +1.3 pp |
-| n=1k,  dim=128 | **100.0%** | 98.1% | +1.9 pp | 98.7% | +1.3 pp |
-| n=10k, dim=32  |  **99.9%** | 97.4% | +2.5 pp | 99.1% | +0.8 pp |
-| n=10k, dim=128 |      95.6% | 93.6% | +2.0 pp | 98.7% | **−3.1 pp** |
-| n=50k, dim=128 |      78.0% | 75.2% | +2.8 pp | 93.2% | **−15.2 pp** |
-
-> hnsw v0.11 wins on recall at large n / high dim because it runs full Algorithm 4
-> on *every* reverse-edge prune.  Switching our index to `PruneStrategy::Heuristic`
-> closes most of the gap while keeping a 2–3× insert-speed advantage.
-
-**`PruneStrategy::Heuristic` recall gain vs Simple**
-
-| Workload | Simple | Heuristic | gain |
-|---|---:|---:|---|
-| n=1k,  dim=32  | 100.0% | 100.0% | — |
-| n=1k,  dim=128 | 100.0% | 100.0% | — |
-| n=10k, dim=32  |  99.9% | 100.0% | +0.1 pp |
-| n=10k, dim=128 |  95.6% |  96.6% | **+1.0 pp** |
-| n=50k, dim=128 |  78.0% |  78.7% | **+0.7 pp** |
 
 ---
 
@@ -568,17 +467,12 @@ cargo build --release
 cargo bench --bench bench                  # default workloads (≤ 50k)
 cargo bench --bench bench -- --full        # scale to 1 M in 100k steps
 
-# 3-library ANN quality + speed comparison
-cargo bench --bench compare                # default workloads (≤ 50k)
-cargo bench --bench compare -- --full      # scale to 1 M  (~hours)
-
 # Persistence: save / load / mmap-load timing
 cargo bench --bench persist                # default workloads (≤ 50k)
 cargo bench --bench persist -- --full      # scale to 1 M  (~hours)
 
 # Regenerate all figures
 python3 figures/plot_bench.py              # bench_fig1–4
-python3 figures/plot_benchmarks.py         # fig1–7 (3-library comparison)
 python3 figures/plot_persist.py            # fig7_save – fig10
 ```
 
@@ -603,14 +497,12 @@ hnsw/
 │   └── builder.rs      Ergonomic builder (.prune_strategy, .build_labeled, .build_paired)
 ├── benches/
 │   ├── bench.rs        Standalone wall-clock timing (ours only); writes bench.jsonl
-│   ├── compare.rs      3-library comparison (ours/hnsw_rs/hnsw v0.11); writes compare.jsonl
 │   └── persist.rs      Save / load / mmap-load timing + file sizes; writes persist.csv
 ├── examples/
 │   ├── demo.rs         Core HNSW walkthrough
 │   └── store.rs        Persistence + LabeledIndex + PairedIndex demos
 └── figures/
     ├── plot_bench.py              Plotter for bench.jsonl → bench_fig1–4
-    ├── plot_benchmarks.py         Plotter for compare.jsonl → fig1–7
     ├── plot_persist.py            Plotter for persist.csv → fig7_save–fig10
     │
     ├── bench_fig1_insert_throughput.png   Ours: insert vecs/s by workload

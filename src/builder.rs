@@ -1,8 +1,8 @@
 //! Ergonomic builder for [`Hnsw`].
 //!
 //! ```
-//! use hnsw::{Builder, Hnsw};
-//! use hnsw::distance::Cosine;
+//! use fast_hnsw::{Builder, Hnsw};
+//! use fast_hnsw::distance::Cosine;
 //!
 //! let index: Hnsw<Cosine> = Builder::new()
 //!     .m(32)
@@ -89,8 +89,8 @@ impl Builder {
     /// to `M`.  **Zero new distance computations** — the `f32` distance in
     /// each `(u32, f32)` connection entry was recorded at edge-add time and
     /// is always current (symmetric metric).  Approximately 80× faster per
-    /// prune than `Heuristic`; equivalent to what faiss and hnsw_rs use for
-    /// reverse-update pruning.
+    /// prune than `Heuristic`; equivalent to a common sort-and-truncate
+    /// reverse-update prune.
     ///
     /// ## `Heuristic`
     ///
@@ -108,8 +108,8 @@ impl Builder {
     /// # Example
     ///
     /// ```
-    /// use hnsw::{Builder, PruneStrategy};
-    /// use hnsw::distance::Euclidean;
+    /// use fast_hnsw::{Builder, PruneStrategy};
+    /// use fast_hnsw::distance::Euclidean;
     ///
     /// // Fastest inserts (default):
     /// let fast = Builder::new()

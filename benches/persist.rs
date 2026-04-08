@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 // Absolute path to figures/ baked in at compile time.
 const FIGURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/figures");
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand::rngs::SmallRng;
 
 use fast_hnsw::{Builder, Hnsw};
@@ -90,7 +90,7 @@ const WORKLOADS_FULL: &[(usize, usize, &str)] = &[
 
 fn gen_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = SmallRng::seed_from_u64(seed);
-    (0..n).map(|_| (0..dim).map(|_| rng.gen::<f32>()).collect()).collect()
+    (0..n).map(|_| (0..dim).map(|_| rng.random::<f32>()).collect()).collect()
 }
 
 fn label_string(id: usize) -> String {
@@ -131,7 +131,7 @@ fn build_labeled_vec_f32(corpus: &[Vec<f32>], sec_dim: usize) -> LabeledIndex<Eu
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
         .build_labeled(Euclidean);
     for v in corpus {
-        let sec: Vec<f32> = (0..sec_dim).map(|_| rng.gen::<f32>()).collect();
+        let sec: Vec<f32> = (0..sec_dim).map(|_| rng.random::<f32>()).collect();
         idx.insert(v.clone(), sec);
     }
     idx

@@ -16,8 +16,8 @@
 //! # Example — classification label
 //!
 //! ```rust
-//! use hnsw::labeled::LabeledIndex;
-//! use hnsw::distance::Euclidean;
+//! use fast_hnsw::labeled::LabeledIndex;
+//! use fast_hnsw::distance::Euclidean;
 //!
 //! let mut idx: LabeledIndex<Euclidean, u32> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
@@ -36,8 +36,8 @@
 //! # Example — text label + save/load
 //!
 //! ```rust,no_run
-//! use hnsw::labeled::LabeledIndex;
-//! use hnsw::distance::Euclidean;
+//! use fast_hnsw::labeled::LabeledIndex;
+//! use fast_hnsw::distance::Euclidean;
 //!
 //! let mut idx: LabeledIndex<Euclidean, String> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
@@ -106,8 +106,8 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     /// Build from an existing [`Builder`].
     ///
     /// ```rust
-    /// use hnsw::{Builder, labeled::LabeledIndex};
-    /// use hnsw::distance::Euclidean;
+    /// use fast_hnsw::{Builder, labeled::LabeledIndex};
+    /// use fast_hnsw::distance::Euclidean;
     ///
     /// let mut idx: LabeledIndex<Euclidean, String> = Builder::new()
     ///     .m(16)
@@ -229,8 +229,8 @@ impl Builder {
     /// Consume the builder and create an empty [`LabeledIndex`].
     ///
     /// ```rust
-    /// use hnsw::{Builder, labeled::LabeledIndex};
-    /// use hnsw::distance::Euclidean;
+    /// use fast_hnsw::{Builder, labeled::LabeledIndex};
+    /// use fast_hnsw::distance::Euclidean;
     ///
     /// let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
     ///     .m(16)

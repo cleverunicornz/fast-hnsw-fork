@@ -70,7 +70,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::distance::Distance;
 use crate::heap::DistId;
@@ -327,9 +327,8 @@ impl Scratch {
 /// # Which to choose
 ///
 /// **`Simple` (default)** — use when insert throughput is the priority.
-/// Equivalent to what most production HNSW libraries (faiss, hnsw_rs) do for
-/// reverse-update pruning.  The small recall gap can be recovered by raising
-/// `ef` at query time.
+/// Equivalent to a common sort-and-truncate reverse-update prune.  The small
+/// recall gap can be recovered by raising `ef` at query time.
 ///
 /// **`Heuristic`** — use when recall quality is non-negotiable or you need
 /// a like-for-like algorithmic comparison.  Runs the full paper Algorithm 4
@@ -462,8 +461,8 @@ pub struct SearchResult {
 ///
 /// # Example
 /// ```
-/// use hnsw::{Hnsw, Config};
-/// use hnsw::distance::Euclidean;
+/// use fast_hnsw::{Hnsw, Config};
+/// use fast_hnsw::distance::Euclidean;
 ///
 /// let mut index = Hnsw::new(Config::default(), Euclidean);
 /// index.insert(vec![1.0, 0.0]);
@@ -515,7 +514,7 @@ impl<D: Distance> Hnsw<D> {
             vec_store:   VecStore::new(0, cap),
             connections: Vec::with_capacity(cap),
             entry_point: None,
-            rng:         SmallRng::from_entropy(),
+            rng:         rand::make_rng(),
             dim:         None,
             visited:     VisitedTracker::new(cap.max(64)),
             scratch:     Scratch::new(ef),
@@ -548,7 +547,7 @@ impl<D: Distance> Hnsw<D> {
             vec_store,
             connections,
             entry_point,
-            rng:        SmallRng::from_entropy(),
+            rng:        rand::make_rng(),
             dim,
             visited:    VisitedTracker::new(n.max(64)),
             scratch:    Scratch::new(ef),
@@ -757,7 +756,7 @@ impl<D: Distance> Hnsw<D> {
     // ─── Level generation ─────────────────────────────────────────────────
 
     fn random_level(&mut self) -> usize {
-        let u: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
+        let u: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         (-u.ln() * self.config.m_l()).floor() as usize
     }
 

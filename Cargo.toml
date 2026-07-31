@@ -38,6 +38,11 @@ name  = "persist"
 path  = "benches/persist.rs"
 harness = false
 
+[[bench]]
+name = "fvecs"
+path = "benches/fvecs.rs"
+harness = false
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"

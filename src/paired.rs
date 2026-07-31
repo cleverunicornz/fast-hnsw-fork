@@ -136,10 +136,9 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     /// );
     /// ```
     pub fn from_builder(builder: Builder, metric_a: A, metric_b: B) -> Self {
-        let cfg = builder.into_config();
         Self {
-            index_a: Hnsw::new(cfg.clone(), metric_a),
-            index_b: Hnsw::new(cfg, metric_b),
+            index_a: builder.clone().build(metric_a),
+            index_b: builder.build(metric_b),
         }
     }
 

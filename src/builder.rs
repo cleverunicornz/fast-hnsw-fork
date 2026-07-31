@@ -151,8 +151,9 @@ impl Builder {
 
     /// Consume the builder and return the resolved [`Config`].
     ///
-    /// Used internally by [`build_labeled`] and [`build_paired`]; also
-    /// useful when you need to share the same config across multiple indexes.
+    /// Useful when you need to share the same config across multiple indexes.
+    /// This intentionally discards the optional seed; call [`Self::build`],
+    /// [`build_labeled`], or [`build_paired`] when seeded construction matters.
     pub fn into_config(self) -> Config {
         self.config
     }

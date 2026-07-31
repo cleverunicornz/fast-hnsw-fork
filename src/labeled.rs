@@ -128,7 +128,9 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///     .build_labeled(Euclidean);
     /// ```
     pub fn from_builder(builder: Builder, metric: D) -> Self {
-        Self::new(builder.into_config(), metric)
+        let inner = builder.build(metric);
+        let payloads = Vec::with_capacity(inner.config().capacity);
+        Self { inner, payloads }
     }
 
     // ─── Mutation ─────────────────────────────────────────────────────────

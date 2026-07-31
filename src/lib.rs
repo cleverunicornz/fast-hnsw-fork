@@ -828,6 +828,30 @@ mod tests {
     }
 
     #[test]
+    fn seeded_labeled_builder_is_byte_reproducible() {
+        let build = || {
+            let mut index = Builder::new()
+                .m(8)
+                .ef_construction(32)
+                .seed(400)
+                .build_labeled(Euclidean);
+            for id in 0..200_u32 {
+                index.insert(vec![id as f32, (id % 17) as f32], id);
+            }
+            index
+        };
+        let directory = tempdir();
+        let left = directory.join("seeded-labeled-left.hnsw");
+        let right = directory.join("seeded-labeled-right.hnsw");
+        build().save_compact(&left).expect("left save failed");
+        build().save_compact(&right).expect("right save failed");
+        assert_eq!(
+            std::fs::read(left).expect("left read failed"),
+            std::fs::read(right).expect("right read failed")
+        );
+    }
+
+    #[test]
     fn labeled_insert_and_search_string() {
         let mut idx: LabeledIndex<Euclidean, String> =
             Builder::new().seed(401).build_labeled(Euclidean);
@@ -1029,6 +1053,37 @@ mod tests {
         let hits_b = idx.search_by_b(&[0.1, 0.9, 0.0], 1, 20);
         assert_eq!(hits_b[0].id, 1);
         assert_eq!(hits_b[0].emb_a, &[0.0f32, 1.0]);
+    }
+
+    #[test]
+    fn seeded_paired_builder_is_byte_reproducible() {
+        let build = || {
+            let mut index = Builder::new()
+                .m(8)
+                .ef_construction(32)
+                .seed(500)
+                .build_paired(Euclidean, Euclidean);
+            for id in 0..200_u32 {
+                index.insert(
+                    vec![id as f32, (id % 11) as f32],
+                    vec![(id % 13) as f32, id as f32],
+                );
+            }
+            index
+        };
+        let directory = tempdir();
+        let left = directory.join("seeded-paired-left");
+        let right = directory.join("seeded-paired-right");
+        build().save(&left).expect("left save failed");
+        build().save(&right).expect("right save failed");
+        for side in ["_a.hnsw", "_b.hnsw"] {
+            let left = std::path::PathBuf::from(format!("{}{side}", left.display()));
+            let right = std::path::PathBuf::from(format!("{}{side}", right.display()));
+            assert_eq!(
+                std::fs::read(left).expect("left read failed"),
+                std::fs::read(right).expect("right read failed")
+            );
+        }
     }
 
     #[test]

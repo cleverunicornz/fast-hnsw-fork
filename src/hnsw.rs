@@ -200,6 +200,88 @@ impl VecStore {
     }
 }
 
+// ─── Graph storage ───────────────────────────────────────────────────────────
+
+pub(crate) type Edge = (u32, f32);
+pub(crate) type OwnedGraph = Vec<Vec<Vec<Edge>>>;
+
+/// Storage boundary for HNSW adjacency lists.
+///
+/// Today the graph is owned and mutable. Search deliberately accesses it
+/// through [`GraphStore::neighbours`] so a read-only memory-mapped
+/// implementation can decode on-disk edges without changing the search
+/// algorithm or relying on the alignment/layout of `(u32, f32)`.
+pub(crate) struct GraphStore {
+    owned: OwnedGraph,
+}
+
+pub(crate) struct Neighbours<'a> {
+    inner: std::iter::Copied<std::slice::Iter<'a, Edge>>,
+}
+
+impl Iterator for Neighbours<'_> {
+    type Item = Edge;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Neighbours<'_> {}
+
+impl GraphStore {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            owned: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn from_owned(owned: OwnedGraph) -> Self {
+        Self { owned }
+    }
+
+    #[inline]
+    pub(crate) fn node_count(&self) -> usize {
+        self.owned.len()
+    }
+
+    #[inline]
+    pub(crate) fn level_count(&self, node: usize) -> usize {
+        self.owned[node].len()
+    }
+
+    #[inline]
+    pub(crate) fn neighbour_count(&self, node: usize, layer: usize) -> usize {
+        self.owned[node][layer].len()
+    }
+
+    #[inline]
+    pub(crate) fn neighbours(&self, node: usize, layer: usize) -> Option<Neighbours<'_>> {
+        self.owned
+            .get(node)
+            .and_then(|layers| layers.get(layer))
+            .map(|edges| Neighbours {
+                inner: edges.iter().copied(),
+            })
+    }
+
+    #[inline]
+    fn push_node(&mut self, connections: Vec<Vec<Edge>>) {
+        self.owned.push(connections);
+    }
+
+    #[inline]
+    fn neighbours_mut(&mut self, node: usize, layer: usize) -> &mut Vec<Edge> {
+        &mut self.owned[node][layer]
+    }
+}
+
 // ─── Generation-counter visited-set ──────────────────────────────────────────
 
 /// O(1) visited-node tracker.  Each search query increments `current`; a node
@@ -478,12 +560,12 @@ pub struct Hnsw<D: Distance> {
     pub(crate) metric: D,
     /// Flat vector store: vector `i` at `data[i*dim .. (i+1)*dim]`.
     pub(crate) vec_store: VecStore,
-    /// `connections[node][layer]` = list of (neighbour_id_u32, dist_from_node_to_neighbour).
+    /// HNSW adjacency storage, addressed by node and layer.
     ///
     /// Storing the distance alongside the id enables the heuristic reverse-update
     /// prune to skip all M distance recomputations — only the O(M²/2) pairwise
     /// diversity checks remain.
-    pub(crate) connections: Vec<Vec<Vec<(u32, f32)>>>,
+    pub(crate) graph: GraphStore,
     pub(crate) entry_point: Option<(usize, usize)>,
     rng:         SmallRng,
     pub(crate) dim: Option<usize>,
@@ -513,7 +595,7 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
-            connections: Vec::with_capacity(cap),
+            graph:        GraphStore::with_capacity(cap),
             entry_point: None,
             rng:         SmallRng::from_entropy(),
             dim:         None,
@@ -535,7 +617,7 @@ impl<D: Distance> Hnsw<D> {
         config:      Config,
         metric:      D,
         vec_store:   VecStore,
-        connections: Vec<Vec<Vec<(u32, f32)>>>,
+        connections: OwnedGraph,
         entry_point: Option<(usize, usize)>,
         dim:         Option<usize>,
     ) -> Self {
@@ -546,7 +628,7 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store,
-            connections,
+            graph: GraphStore::from_owned(connections),
             entry_point,
             rng:        SmallRng::from_entropy(),
             dim,
@@ -569,7 +651,7 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
-            connections: Vec::with_capacity(cap),
+            graph:        GraphStore::with_capacity(cap),
             entry_point: None,
             rng:         SmallRng::seed_from_u64(seed),
             dim:         None,
@@ -607,7 +689,7 @@ impl<D: Distance> Hnsw<D> {
         for l in 0..=q_level {
             conn.push(Vec::with_capacity(self.config.max_links(l)));
         }
-        self.connections.push(conn);
+        self.graph.push_node(conn);
 
         if self.visited.stamps.len() <= q {
             self.visited.stamps.resize(q * 2 + 1, 0);
@@ -662,8 +744,8 @@ impl<D: Distance> Hnsw<D> {
             for i in 0..n_sel {
                 let (nb_u32, dist_q_nb) = edge_buf[i];
                 let nb = nb_u32 as usize;
-                self.connections[q][layer].push((nb_u32, dist_q_nb));
-                self.connections[nb][layer].push((q as u32, dist_q_nb));
+                self.graph.neighbours_mut(q, layer).push((nb_u32, dist_q_nb));
+                self.graph.neighbours_mut(nb, layer).push((q as u32, dist_q_nb));
             }
 
             // Pass 2: prune any neighbour whose list now exceeds m_max.
@@ -674,7 +756,7 @@ impl<D: Distance> Hnsw<D> {
             // branch needs to recompute the M distances from scratch.
             for i in 0..n_sel {
                 let nb = edge_buf[i].0 as usize;
-                if self.connections[nb][layer].len() > m_max {
+                if self.graph.neighbour_count(nb, layer) > m_max {
                     match self.config.prune_strategy {
 
                         // ── Simple: sort stored distances + truncate ──────────
@@ -683,9 +765,9 @@ impl<D: Distance> Hnsw<D> {
                         //       connection list — no vector data touched, no new
                         //       distance computation.  ~25 ns per call.
                         PruneStrategy::Simple => {
-                            self.connections[nb][layer]
+                            self.graph.neighbours_mut(nb, layer)
                                 .sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                            self.connections[nb][layer].truncate(m_max);
+                            self.graph.neighbours_mut(nb, layer).truncate(m_max);
                         }
 
                         // ── Heuristic: full Algorithm 4 with stored distances ─
@@ -732,14 +814,14 @@ impl<D: Distance> Hnsw<D> {
 
         for layer in (1..=ep_level).rev() {
             Self::do_search_layer(
-                &self.vec_store, &self.connections, &self.metric,
+                &self.vec_store, &self.graph, &self.metric,
                 &mut visited, &mut scratch, query, &ep, 1, layer,
             );
             std::mem::swap(&mut ep, &mut scratch.out);
         }
 
         Self::do_search_layer(
-            &self.vec_store, &self.connections, &self.metric,
+            &self.vec_store, &self.graph, &self.metric,
             &mut visited, &mut scratch, query, &ep, ef, 0,
         );
         scratch.out.truncate(k);
@@ -772,7 +854,7 @@ impl<D: Distance> Hnsw<D> {
 
     fn search_layer_node(&mut self, q: usize, ef: usize, layer: usize) {
         let vec_store   = &self.vec_store;
-        let connections = &self.connections;
+        let graph       = &self.graph;
         let metric      = &self.metric;
         let visited     = &mut self.visited;
         let scratch     = &mut self.scratch;
@@ -791,8 +873,8 @@ impl<D: Distance> Hnsw<D> {
             let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
             if c.dist > worst { break; }
 
-            if let Some(nb_list) = connections.get(c.id).and_then(|nc| nc.get(layer)) {
-                for &(nb_u32, _) in nb_list {
+            if let Some(nb_list) = graph.neighbours(c.id, layer) {
+                for (nb_u32, _) in nb_list {
                     let nb = nb_u32 as usize;
                     if visited.visit(nb) {
                         let nb_dist = metric.distance(q_vec, vec_store.get(nb));
@@ -811,7 +893,7 @@ impl<D: Distance> Hnsw<D> {
 
     fn do_search_layer(
         vec_store:    &VecStore,
-        connections:  &[Vec<Vec<(u32, f32)>>],
+        graph:        &GraphStore,
         metric:       &D,
         visited:      &mut VisitedTracker,
         scratch:      &mut Scratch,
@@ -832,8 +914,8 @@ impl<D: Distance> Hnsw<D> {
             let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
             if c.dist > worst { break; }
 
-            if let Some(nb_list) = connections.get(c.id).and_then(|nc| nc.get(layer)) {
-                for &(nb_u32, _) in nb_list {
+            if let Some(nb_list) = graph.neighbours(c.id, layer) {
+                for (nb_u32, _) in nb_list {
                     let nb = nb_u32 as usize;
                     if visited.visit(nb) {
                         let nb_dist = metric.distance(query, vec_store.get(nb));
@@ -898,8 +980,8 @@ impl<D: Distance> Hnsw<D> {
                 self.scratch.out.iter().map(|d| d.id).collect();
             let mut extra: Vec<DistId> = Vec::new();
             for &d in &self.scratch.out {
-                if let Some(nb_list) = self.connections.get(d.id).and_then(|nc| nc.get(layer)) {
-                    for &(nb_u32, _) in nb_list {
+                if let Some(nb_list) = self.graph.neighbours(d.id, layer) {
+                    for (nb_u32, _) in nb_list {
                         let nb = nb_u32 as usize;
                         if !seen_ids.contains(&nb) {
                             extra.push(DistId::new(self.dist(q, nb), nb));
@@ -975,9 +1057,7 @@ impl<D: Distance> Hnsw<D> {
     fn prune_connections_heuristic(&mut self, node_id: usize, layer: usize, m_max: usize) {
         // ── Step 1: load stored (id, dist_from_node) into prune_buf ──────
         self.prune_buf.clear();
-        let conn_len = self.connections[node_id][layer].len();
-        for i in 0..conn_len {
-            let (nb_u32, dist) = self.connections[node_id][layer][i];
+        for (nb_u32, dist) in self.graph.neighbours(node_id, layer).into_iter().flatten() {
             self.prune_buf.push((nb_u32 as usize, dist));
         }
         // Sort closest-first by stored distance — no distance computation.
@@ -1025,10 +1105,10 @@ impl<D: Distance> Hnsw<D> {
         }
 
         // ── Step 3: write result back to the connection list ──────────────
-        self.connections[node_id][layer].clear();
+        self.graph.neighbours_mut(node_id, layer).clear();
         for i in 0..self.select_buf.len() {
             let (id, dist) = self.select_buf[i];
-            self.connections[node_id][layer].push((id as u32, dist));
+            self.graph.neighbours_mut(node_id, layer).push((id as u32, dist));
         }
     }
 
@@ -1039,10 +1119,10 @@ impl<D: Distance> Hnsw<D> {
         let max_level = self.entry_point.map(|(_, l)| l).unwrap_or(0);
         let mut layer_counts = vec![0usize; max_level + 1];
         let mut layer_edges  = vec![0usize; max_level + 1];
-        for node_conn in &self.connections {
-            for (l, conn) in node_conn.iter().enumerate() {
+        for node in 0..self.graph.node_count() {
+            for l in 0..self.graph.level_count(node) {
                 layer_counts[l] += 1;
-                layer_edges[l]  += conn.len();
+                layer_edges[l] += self.graph.neighbour_count(node, l);
             }
         }
         IndexStats { num_vectors: self.vec_store.len(), max_level, layer_counts, layer_edges }

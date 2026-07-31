@@ -97,7 +97,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::distance::Distance;
-use crate::hnsw::{Config, Hnsw, PruneStrategy, VecStore};
+use crate::hnsw::{Config, Hnsw, OwnedGraph, PruneStrategy, VecStore};
 use crate::payload::Payload;
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
@@ -146,10 +146,12 @@ fn hnsw_section_bytes<D: Distance>(index: &Hnsw<D>) -> u64 {
 
     // Sum the connection-data bytes: for each node, for each layer,
     // 4 bytes (n_conns) + n_conns × 8 bytes (id + dist pairs).
-    let conn_bytes: u64 = index.connections.iter()
-        .flat_map(|node_conn| node_conn.iter())
-        .map(|layer_conn| 4 + (layer_conn.len() as u64) * 8)
-        .sum();
+    let mut conn_bytes = 0u64;
+    for node in 0..index.graph.node_count() {
+        for layer in 0..index.graph.level_count(node) {
+            conn_bytes += 4 + (index.graph.neighbour_count(node, layer) as u64) * 8;
+        }
+    }
 
     VECTORS_OFFSET as u64          // fixed header
     + (n as u64) * (dim as u64) * 4   // vectors
@@ -342,8 +344,8 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     w.write_all(index.vec_store.as_bytes())?;
 
     // ── Levels ────────────────────────────────────────────────────────────
-    for node_conn in &index.connections {
-        let level = (node_conn.len() as u32).saturating_sub(1);
+    for node in 0..index.graph.node_count() {
+        let level = (index.graph.level_count(node) as u32).saturating_sub(1);
         w.write_all(&u32_le(level))?;
     }
 
@@ -369,11 +371,11 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
         + (n as u64) * 8;
 
     let mut running_off = conn_data_base;
-    for node_conn in &index.connections {
+    for node in 0..index.graph.node_count() {
         w.write_all(&u64_le(running_off))?;
-        for layer_conn in node_conn {
+        for layer in 0..index.graph.level_count(node) {
             // 4 bytes for n_conns header + 8 bytes per (id, dist) pair.
-            running_off += 4 + (layer_conn.len() as u64) * 8;
+            running_off += 4 + (index.graph.neighbour_count(node, layer) as u64) * 8;
         }
     }
 
@@ -383,14 +385,14 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     // and written with one write_all call — one syscall per layer instead of
     // three (n_conns header + id + dist) per pair.
     let mut conn_buf: Vec<u8> = Vec::new();
-    for node_conn in &index.connections {
-        for layer_conn in node_conn {
-            let n_conns = layer_conn.len();
+    for node in 0..index.graph.node_count() {
+        for layer in 0..index.graph.level_count(node) {
+            let n_conns = index.graph.neighbour_count(node, layer);
             // Reserve: 4 bytes for n_conns + 8 bytes per pair.
             conn_buf.clear();
             conn_buf.reserve(4 + n_conns * 8);
             conn_buf.extend_from_slice(&u32_le(n_conns as u32));
-            for &(id, dist) in layer_conn {
+            for (id, dist) in index.graph.neighbours(node, layer).into_iter().flatten() {
                 conn_buf.extend_from_slice(&u32_le(id));
                 conn_buf.extend_from_slice(&f32_le(dist));
             }
@@ -561,7 +563,7 @@ fn read_header<R: Read + Seek>(
 fn read_graph<R: Read + Seek>(
     r: &mut R,
     n: usize,
-) -> io::Result<(Vec<Vec<Vec<(u32, f32)>>>, u64)> {
+) -> io::Result<(OwnedGraph, u64)> {
     // ── Levels: one bulk read of n × 4 bytes ─────────────────────────────
     let mut raw_levels = vec![0u8; n * 4];
     r.read_exact(&mut raw_levels)?;
@@ -585,7 +587,7 @@ fn read_graph<R: Read + Seek>(
     // order, so we read straight through without seeking.  Each layer's
     // (id, dist) pairs are bulk-read into a single byte buffer and decoded
     // in one pass.
-    let mut connections: Vec<Vec<Vec<(u32, f32)>>> = Vec::with_capacity(n);
+    let mut connections: OwnedGraph = Vec::with_capacity(n);
     let mut pair_buf: Vec<u8> = Vec::new();
     let mut buf4 = [0u8; 4];
 

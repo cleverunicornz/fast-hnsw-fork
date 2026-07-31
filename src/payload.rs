@@ -7,7 +7,7 @@
 //! implementing [`Payload`]:
 //!
 //! ```rust
-//! use hnsw::payload::{Payload, DecodeError};
+//! use fast_hnsw::payload::{Payload, DecodeError};
 //!
 //! #[derive(Clone)]
 //! struct MyLabel { category: u16, score: f32 }

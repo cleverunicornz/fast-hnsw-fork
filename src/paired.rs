@@ -35,8 +35,8 @@
 //! ## Example
 //!
 //! ```rust
-//! use hnsw::paired::PairedIndex;
-//! use hnsw::distance::Euclidean;
+//! use fast_hnsw::paired::PairedIndex;
+//! use fast_hnsw::distance::Euclidean;
 //!
 //! // text_dim=4, image_dim=3 (toy example)
 //! let mut idx: PairedIndex<Euclidean, Euclidean> = PairedIndex::new(
@@ -127,8 +127,8 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     /// Use [`new`](Self::new) if you need different configs per side.
     ///
     /// ```rust
-    /// use hnsw::{Builder, paired::PairedIndex};
-    /// use hnsw::distance::{Euclidean, Cosine};
+    /// use fast_hnsw::{Builder, paired::PairedIndex};
+    /// use fast_hnsw::distance::{Euclidean, Cosine};
     ///
     /// let mut idx = PairedIndex::from_builder(
     ///     Builder::new().m(16).ef_construction(200),
@@ -240,7 +240,7 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     ///
     /// # Example
     /// ```no_run
-    /// # use hnsw::paired::PairedIndex; use hnsw::distance::Euclidean;
+    /// # use fast_hnsw::paired::PairedIndex; use fast_hnsw::distance::Euclidean;
     /// # let idx: PairedIndex<Euclidean, Euclidean> = PairedIndex::new(Default::default(), Euclidean, Default::default(), Euclidean);
     /// idx.save("my_index").unwrap();
     /// // Writes: my_index_a.hnsw  my_index_b.hnsw
@@ -258,7 +258,7 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     ///
     /// # Example
     /// ```no_run
-    /// # use hnsw::paired::PairedIndex; use hnsw::distance::Euclidean;
+    /// # use fast_hnsw::paired::PairedIndex; use fast_hnsw::distance::Euclidean;
     /// let idx = PairedIndex::<Euclidean, Euclidean>::load(
     ///     "my_index", Euclidean, Euclidean
     /// ).unwrap();
@@ -307,8 +307,8 @@ impl Builder {
     /// config for both sides.
     ///
     /// ```rust
-    /// use hnsw::{Builder, paired::PairedIndex};
-    /// use hnsw::distance::{Euclidean, Cosine};
+    /// use fast_hnsw::{Builder, paired::PairedIndex};
+    /// use fast_hnsw::distance::{Euclidean, Cosine};
     ///
     /// let mut idx = Builder::new()
     ///     .m(16)

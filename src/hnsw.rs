@@ -462,8 +462,8 @@ pub struct SearchResult {
 ///
 /// # Example
 /// ```
-/// use hnsw::{Hnsw, Config};
-/// use hnsw::distance::Euclidean;
+/// use fast_hnsw::{Hnsw, Config};
+/// use fast_hnsw::distance::Euclidean;
 ///
 /// let mut index = Hnsw::new(Config::default(), Euclidean);
 /// index.insert(vec![1.0, 0.0]);

@@ -72,7 +72,7 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn build_index(n: usize, dim: usize, seed: u64) -> Hnsw<Euclidean> {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 1_000);
         let mut index = Builder::new()
             .m(16)
@@ -80,7 +80,7 @@ mod tests {
             .seed(seed)
             .build(Euclidean);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v);
         }
         index
@@ -193,7 +193,7 @@ mod tests {
     // ── recall tests ──────────────────────────────────────────────────────
 
     fn recall(index: &Hnsw<Euclidean>, vectors: &[Vec<f32>], k: usize, ef: usize, n_queries: usize) -> f64 {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99_999);
         let dim = vectors[0].len();
 
@@ -201,7 +201,7 @@ mod tests {
         let mut total = 0usize;
 
         for _ in 0..n_queries {
-            let query: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             let exact = exact_knn(vectors, &query, k);
             let approx: Vec<usize> = index.search(&query, k, ef).iter().map(|r| r.id).collect();
             let exact_set: std::collections::HashSet<usize> = exact.into_iter().collect();
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn recall_128d_is_acceptable() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(77);
         let dim = 128;
         let n = 1_000;
@@ -231,7 +231,7 @@ mod tests {
             .build(Euclidean);
 
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             vectors.push(v);
         }
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn recall_32d_high_ef_is_near_perfect() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(55);
         let dim = 32;
         let n = 500;
@@ -257,7 +257,7 @@ mod tests {
             .build(Euclidean);
 
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             vectors.push(v);
         }
@@ -369,12 +369,12 @@ mod tests {
     // ── Persistence tests ─────────────────────────────────────────────────
 
     fn make_hnsw(n: usize, dim: usize, seed: u64) -> (Hnsw<Euclidean>, Vec<Vec<f32>>) {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 5_000);
         let mut index = Builder::new().m(16).ef_construction(200).seed(seed).build(Euclidean);
         let mut corpus = Vec::with_capacity(n);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             corpus.push(v);
         }
@@ -774,7 +774,7 @@ mod tests {
     fn build_with_prune(n: usize, dim: usize, seed: u64, ps: PruneStrategy)
         -> (Hnsw<Euclidean>, Vec<Vec<f32>>)
     {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 2_000);
         let mut index = Builder::new()
             .m(16)
@@ -784,7 +784,7 @@ mod tests {
             .build(Euclidean);
         let mut corpus = Vec::with_capacity(n);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             corpus.push(v);
         }

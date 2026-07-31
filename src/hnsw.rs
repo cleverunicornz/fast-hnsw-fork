@@ -70,7 +70,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::distance::Distance;
 use crate::heap::DistId;
@@ -702,7 +702,7 @@ impl<D: Distance> Hnsw<D> {
             vec_store:   VecStore::new(0, cap),
             graph:        GraphStore::with_capacity(cap),
             entry_point: None,
-            rng:         SmallRng::from_entropy(),
+            rng:         rand::make_rng(),
             dim:         None,
             visited:     VisitedTracker::new(cap.max(64)),
             scratch:     Scratch::new(ef),
@@ -735,7 +735,7 @@ impl<D: Distance> Hnsw<D> {
             vec_store,
             graph,
             entry_point,
-            rng:        SmallRng::from_entropy(),
+            rng:        rand::make_rng(),
             dim,
             visited:    VisitedTracker::new(n.max(64)),
             scratch:    Scratch::new(ef),
@@ -944,7 +944,7 @@ impl<D: Distance> Hnsw<D> {
     // ─── Level generation ─────────────────────────────────────────────────
 
     fn random_level(&mut self) -> usize {
-        let u: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
+        let u: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         (-u.ln() * self.config.m_l()).floor() as usize
     }
 

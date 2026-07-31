@@ -69,12 +69,12 @@ fn main() {
     // ── Example 3: index statistics ─────────────────────────────────────
     println!("▶  Example 3 — Index statistics");
     {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
         let mut index: Hnsw<Euclidean> = Builder::new().m(16).ef_construction(200).seed(7).build(Euclidean);
 
         for _ in 0..2_000 {
-            let v: Vec<f32> = (0..64).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..64).map(|_| rng.random::<f32>()).collect();
             index.insert(v);
         }
 

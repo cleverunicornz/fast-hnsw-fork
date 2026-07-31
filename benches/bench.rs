@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use fast_hnsw::{Builder, Hnsw};
 use fast_hnsw::distance::Euclidean;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 // Absolute path to figures/ baked in at compile time.
 const FIGURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/figures");
@@ -29,7 +29,7 @@ const FIGURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/figures");
 fn random_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     (0..n)
-        .map(|_| (0..dim).map(|_| rng.gen::<f32>()).collect())
+        .map(|_| (0..dim).map(|_| rng.random::<f32>()).collect())
         .collect()
 }
 

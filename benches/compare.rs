@@ -44,7 +44,7 @@ use space::Metric as SpaceMetric;
 use space::Neighbor;
 
 // ── utilities ────────────────────────────────────────────────────────────────
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand::rngs::SmallRng;
 
 // Absolute path to figures/ baked in at compile time.
@@ -117,7 +117,7 @@ impl SpaceMetric<Vec<f32>> for EuclideanV0 {
 
 fn gen_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = SmallRng::seed_from_u64(seed);
-    (0..n).map(|_| (0..dim).map(|_| rng.gen::<f32>()).collect()).collect()
+    (0..n).map(|_| (0..dim).map(|_| rng.random::<f32>()).collect()).collect()
 }
 
 // ─── Exact k-NN (brute-force ground truth) ───────────────────────────────────

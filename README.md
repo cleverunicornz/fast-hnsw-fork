@@ -84,7 +84,9 @@ fn main() {
 |---|---|
 | `insert(Vec<f32>) -> usize` | Add a vector; returns its assigned id (0-based). |
 | `search(&[f32], k, ef) -> Vec<SearchResult>` | Return the `k` approximate nearest neighbours. |
+| `search_with_workspace(&[f32], k, ef, &mut SearchWorkspace)` | Reuse visited and heap storage across repeated searches. |
 | `search_filtered(&[f32], k, ef, predicate)` | Apply id eligibility during traversal; rejected nodes remain navigable but never enter top-k. |
+| `search_filtered_with_workspace(...)` | Combine in-traversal filtering with caller-owned reusable storage. |
 | `get_vector(id) -> &[f32]` | Retrieve a stored vector by id. |
 | `len() / is_empty() / dim() / max_level()` | Index introspection. |
 | `stats() -> IndexStats` | Layer-by-layer node and edge counts. |
@@ -104,6 +106,22 @@ still connect the traversal to eligible regions, but only accepted nodes enter
 the bounded result heap. This enforces filtering before top-k selection and
 avoids the short-result behavior of retrieving `k` globally and filtering
 afterward.
+
+### Reusing query storage
+
+```rust
+use fast_hnsw::SearchWorkspace;
+
+let mut workspace = SearchWorkspace::new(index.len(), 512);
+for query in queries {
+    let hits = index.search_with_workspace(query, 10, 512, &mut workspace);
+    println!("nearest id: {}", hits[0].id);
+}
+```
+
+Give each concurrent worker its own workspace. It grows automatically and
+retains its visited stamps, candidate heap, result heap, and upper-layer entry
+buffer. The returned top-k vector remains caller-owned.
 
 ---
 
@@ -610,6 +628,11 @@ cargo bench --bench fvecs -- \
 # Process-isolated mmap open/query timing (wrap with the platform RSS tool)
 /usr/bin/time -l target/release/deps/mmap_fvecs-<hash> \
   --index /tmp/corpus.hnsw --fvecs /path/to/corpus.fvecs --queries 100
+
+# Add the same one-in-four eligibility fixture used by the comparison harness
+target/release/deps/mmap_fvecs-<hash> \
+  --index /tmp/corpus.hnsw --fvecs /path/to/corpus.fvecs \
+  --queries 100 --filter-modulo 4
 
 # Regenerate all figures
 python3 figures/plot_bench.py              # bench_fig1–4

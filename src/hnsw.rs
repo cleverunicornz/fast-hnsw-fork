@@ -36,30 +36,37 @@
 //! All feature vectors in one `Vec<f32>`, stride = `dim`.  One pointer
 //! dereference instead of two per distance call.
 //!
-//! ### 5 · `VisitedTracker` — O(1) generation-counter visited set
+//! ### 5 · Four-accumulator dot product
+//!
+//! Independent accumulators remove the serial floating-point dependency chain
+//! in normalized-embedding distance calls without a platform-specific SIMD
+//! dependency.
+//!
+//! ### 6 · `VisitedTracker` — O(1) generation-counter visited set
 //!
 //! Replaces `HashSet::with_capacity(ef*4)` (1 703 ns/call) with a stamp array
 //! (105 ns/call) — 16× faster, zero allocation after construction.
 //!
-//! ### 6 · `Scratch` — reusable heap scratch space
+//! ### 7 · `Scratch` / `SearchWorkspace` — reusable query storage
 //!
 //! Both `BinaryHeap`s in `search_layer` are cleared (not reallocated) between
-//! calls.  `ep_buf` is swapped with `scratch.out` via `std::mem::swap` — zero
-//! copy between layers.
+//! calls. `SearchWorkspace` lets repeated `&self` queries retain their visited
+//! stamps, heaps, and entry buffer. `ep_buf` is swapped with `scratch.out` via
+//! `std::mem::swap` — zero copy between layers.
 //!
-//! ### 7 · `u32` + pre-allocated connection `Vec`s
+//! ### 8 · `u32` + pre-allocated connection `Vec`s
 //!
 //! `u32` IDs halve connection-list memory.  Each inner `Vec` is pre-created
 //! with `Vec::with_capacity(m_max)`.
 //!
-//! ### 8 · Triangle-inequality shortcut in heuristic selection
+//! ### 9 · Triangle-inequality shortcut in heuristic selection
 //!
 //! If `d(q,s) > 2·d(q,e)`, then `d(e,s) > d(q,e)` by the triangle
 //! inequality — the heuristic condition is trivially satisfied without
 //! computing the actual distance.  Measured 36% reduction in pairwise
 //! distance computations.
 //!
-//! ### 9 · `select_buf` / `pruned_buf` reuse
+//! ### 10 · `select_buf` / `pruned_buf` reuse
 //!
 //! Pre-allocated `Vec<(usize, f32)>` fields in `Hnsw` hold the results of
 //! `select_neighbours_*`; callers read from `self.select_buf` directly,
@@ -411,6 +418,13 @@ impl VisitedTracker {
         }
     }
 
+    #[inline]
+    fn reserve_nodes(&mut self, capacity: usize) {
+        if self.stamps.len() < capacity {
+            self.stamps.resize(capacity, 0);
+        }
+    }
+
     /// Returns `true` if `id` was **not** previously visited, and marks it.
     #[inline]
     fn visit(&mut self, id: usize) -> bool {
@@ -430,8 +444,8 @@ impl VisitedTracker {
 
 /// Pre-allocated candidate min-heap + result max-heap + sorted output buffer.
 /// Stored inside `Hnsw` and *cleared* (not reallocated) between `search_layer`
-/// calls during `insert`.  For `search()` (`&self`) a local `Scratch` is
-/// created per query.
+/// calls during `insert`. Repeated immutable searches may retain one through
+/// [`SearchWorkspace`].
 struct Scratch {
     candidates:  BinaryHeap<Reverse<DistId>>,
     results:     BinaryHeap<DistId>,
@@ -455,6 +469,21 @@ impl Scratch {
         self.candidates.clear();
         self.results.clear();
         self.results_cap = ef;
+    }
+
+    fn reserve_ef(&mut self, ef: usize) {
+        let candidate_capacity = ef.saturating_mul(2).saturating_add(1);
+        if self.candidates.capacity() < candidate_capacity {
+            self.candidates
+                .reserve(candidate_capacity.saturating_sub(self.candidates.len()));
+        }
+        if self.results.capacity() < ef.saturating_add(1) {
+            self.results
+                .reserve(ef.saturating_add(1).saturating_sub(self.results.len()));
+        }
+        if self.out.capacity() < ef {
+            self.out.reserve(ef.saturating_sub(self.out.len()));
+        }
     }
 
     #[inline]
@@ -501,6 +530,44 @@ impl Scratch {
         self.out.clear();
         while let Some(d) = self.results.pop() { self.out.push(d); }
         self.out.reverse(); // max-heap → farthest-first; reverse → closest-first
+    }
+}
+
+/// Reusable, caller-owned storage for allocation-free repeated searches.
+///
+/// A workspace is mutable and therefore belongs to one query thread at a
+/// time. The index itself remains shared through `&Hnsw`; give each concurrent
+/// worker its own workspace. It grows automatically if either the index or
+/// `ef` exceeds the initial capacities, then retains those allocations.
+pub struct SearchWorkspace {
+    visited: VisitedTracker,
+    scratch: Scratch,
+    entry_points: Vec<DistId>,
+}
+
+impl SearchWorkspace {
+    /// Pre-allocate storage for an expected node count and search `ef`.
+    pub fn new(node_capacity: usize, ef_capacity: usize) -> Self {
+        Self {
+            visited: VisitedTracker::new(node_capacity),
+            scratch: Scratch::new(ef_capacity),
+            entry_points: Vec::with_capacity(ef_capacity),
+        }
+    }
+
+    fn prepare(&mut self, node_capacity: usize, ef_capacity: usize) {
+        self.visited.reserve_nodes(node_capacity);
+        self.scratch.reserve_ef(ef_capacity);
+        self.entry_points.clear();
+        if self.entry_points.capacity() < ef_capacity {
+            self.entry_points.reserve(ef_capacity);
+        }
+    }
+}
+
+impl Default for SearchWorkspace {
+    fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -915,6 +982,23 @@ impl<D: Distance> Hnsw<D> {
     ///
     /// `ef` controls recall vs. speed (`ef ≥ k`; larger → better recall).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_with_workspace(query, k, ef, &mut workspace)
+    }
+
+    /// Search using caller-owned storage retained across queries.
+    ///
+    /// Results are identical to [`Hnsw::search`], but after the workspace has
+    /// reached the required node and `ef` capacities, traversal performs no
+    /// visited-set or heap-buffer allocation. The returned result vector is
+    /// still owned by the caller.
+    pub fn search_with_workspace(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult> {
         assert!(k > 0, "k must be > 0");
         let ef = ef.max(k);
 
@@ -923,24 +1007,27 @@ impl<D: Distance> Hnsw<D> {
             Some(x) => x,
         };
 
-        let mut visited = VisitedTracker::new(self.vec_store.len());
-        let mut scratch = Scratch::new(ef);
-        let mut ep = Vec::with_capacity(ef);
+        workspace.prepare(self.vec_store.len(), ef);
+        let SearchWorkspace {
+            visited,
+            scratch,
+            entry_points,
+        } = workspace;
 
         let ep_dist = self.metric.distance(query, self.vec_store.get(ep_id));
-        ep.push(DistId::new(ep_dist, ep_id));
+        entry_points.push(DistId::new(ep_dist, ep_id));
 
         for layer in (1..=ep_level).rev() {
             Self::do_search_layer(
                 &self.vec_store, &self.graph, &self.metric,
-                &mut visited, &mut scratch, query, &ep, 1, layer,
+                visited, scratch, query, entry_points, 1, layer,
             );
-            std::mem::swap(&mut ep, &mut scratch.out);
+            std::mem::swap(entry_points, &mut scratch.out);
         }
 
         Self::do_search_layer(
             &self.vec_store, &self.graph, &self.metric,
-            &mut visited, &mut scratch, query, &ep, ef, 0,
+            visited, scratch, query, entry_points, ef, 0,
         );
         scratch.out.truncate(k);
         scratch.out.iter()
@@ -968,6 +1055,26 @@ impl<D: Distance> Hnsw<D> {
     where
         F: Fn(usize) -> bool,
     {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_filtered_with_workspace(query, k, ef, accepts, &mut workspace)
+    }
+
+    /// Filtered search using caller-owned storage retained across queries.
+    ///
+    /// This combines the filter-before-top-k semantics of
+    /// [`Hnsw::search_filtered`] with the allocation reuse of
+    /// [`Hnsw::search_with_workspace`].
+    pub fn search_filtered_with_workspace<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> bool,
+    {
         assert!(k > 0, "k must be > 0");
         let ef = ef.max(k);
 
@@ -976,9 +1083,12 @@ impl<D: Distance> Hnsw<D> {
             Some(entry_point) => entry_point,
         };
 
-        let mut visited = VisitedTracker::new(self.vec_store.len());
-        let mut scratch = Scratch::new(ef);
-        let mut entry_points = Vec::with_capacity(ef);
+        workspace.prepare(self.vec_store.len(), ef);
+        let SearchWorkspace {
+            visited,
+            scratch,
+            entry_points,
+        } = workspace;
 
         let entry_distance = self.metric.distance(query, self.vec_store.get(ep_id));
         entry_points.push(DistId::new(entry_distance, ep_id));
@@ -990,24 +1100,24 @@ impl<D: Distance> Hnsw<D> {
                 &self.vec_store,
                 &self.graph,
                 &self.metric,
-                &mut visited,
-                &mut scratch,
+                visited,
+                scratch,
                 query,
-                &entry_points,
+                entry_points,
                 1,
                 layer,
             );
-            std::mem::swap(&mut entry_points, &mut scratch.out);
+            std::mem::swap(entry_points, &mut scratch.out);
         }
 
         Self::do_search_layer_filtered(
             &self.vec_store,
             &self.graph,
             &self.metric,
-            &mut visited,
-            &mut scratch,
+            visited,
+            scratch,
             query,
-            &entry_points,
+            entry_points,
             ef,
             &accepts,
         );

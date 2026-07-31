@@ -55,7 +55,7 @@ pub mod payload;
 pub mod persist;
 
 pub use builder::Builder;
-pub use hnsw::{Config, Hnsw, IndexStats, PruneStrategy, SearchResult};
+pub use hnsw::{Config, Hnsw, IndexStats, PruneStrategy, SearchResult, SearchWorkspace};
 pub use labeled::{LabeledIndex, MappedLabeledIndex, MappedLabeledResult};
 pub use paired::PairedIndex;
 
@@ -201,6 +201,34 @@ mod tests {
         let index = build_index(100, 4, 46);
         let results = index.search_filtered(&[0.5; 4], 10, 100, |_| false);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn reusable_workspace_preserves_search_and_filter_results() {
+        let index = build_index(200, 16, 47);
+        let query = [0.5; 16];
+        let expected = index.search(&query, 10, 50);
+        let expected_filtered = index.search_filtered(&query, 10, 50, |id| id % 3 == 0);
+
+        let mut workspace = SearchWorkspace::default();
+        assert_eq!(
+            index.search_with_workspace(&query, 10, 50, &mut workspace),
+            expected
+        );
+        assert_eq!(
+            index.search_filtered_with_workspace(
+                &query,
+                10,
+                50,
+                |id| id % 3 == 0,
+                &mut workspace,
+            ),
+            expected_filtered
+        );
+        assert_eq!(
+            index.search_with_workspace(&query, 10, 100, &mut workspace),
+            index.search(&query, 10, 100)
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const K: usize = 10;
+const GRAPH_COUNT: usize = 4;
 
 struct Args {
     fvecs: PathBuf,
@@ -41,6 +42,7 @@ fn main() -> io::Result<()> {
     let dimensions = vectors[0].len();
     let queries = build_queries(&vectors, args.queries);
     let exact = exact_results(&vectors, &queries);
+    let exact_filtered = exact_filtered_results(&vectors, &queries);
 
     let mut index: Hnsw<DotProduct> = Builder::new()
         .m(args.m)
@@ -59,11 +61,24 @@ fn main() -> io::Result<()> {
     }
     let mut search_times = Vec::with_capacity(queries.len());
     let mut approximate = Vec::with_capacity(queries.len());
+    let mut filtered_search_times = Vec::with_capacity(queries.len());
+    let mut approximate_filtered = Vec::with_capacity(queries.len());
     for query in &queries {
         let started = Instant::now();
         let result = index.search(query, K, args.ef_search);
         search_times.push(started.elapsed());
         approximate.push(result.into_iter().map(|item| item.id).collect::<Vec<_>>());
+
+        let started = Instant::now();
+        let result =
+            index.search_filtered(query, K, args.ef_search, |id| id % GRAPH_COUNT == 0);
+        filtered_search_times.push(started.elapsed());
+        approximate_filtered.push(
+            result
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+        );
     }
 
     let temporary_snapshot = args.snapshot.is_none();
@@ -113,6 +128,18 @@ fn main() -> io::Result<()> {
     println!(
         "  \"recall_at_10\": {:.6},",
         mean_recall(&exact, &approximate)
+    );
+    println!(
+        "  \"filtered_query_p50_us\": {:.6},",
+        microseconds(percentile(&filtered_search_times, 0.50))
+    );
+    println!(
+        "  \"filtered_query_p99_us\": {:.6},",
+        microseconds(percentile(&filtered_search_times, 0.99))
+    );
+    println!(
+        "  \"filtered_recall_at_10\": {:.6},",
+        mean_recall(&exact_filtered, &approximate_filtered)
     );
     println!("  \"save_ms\": {:.6},", milliseconds(save));
     println!("  \"mmap_open_ms\": {:.6},", milliseconds(mmap_open));
@@ -198,6 +225,21 @@ fn build_queries(vectors: &[Vec<f32>], queries: usize) -> Vec<Vec<f32>> {
 }
 
 fn exact_results(vectors: &[Vec<f32>], queries: &[Vec<f32>]) -> Vec<Vec<usize>> {
+    exact_results_where(vectors, queries, |_| true)
+}
+
+fn exact_filtered_results(vectors: &[Vec<f32>], queries: &[Vec<f32>]) -> Vec<Vec<usize>> {
+    exact_results_where(vectors, queries, |id| id % GRAPH_COUNT == 0)
+}
+
+fn exact_results_where<F>(
+    vectors: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    accepts: F,
+) -> Vec<Vec<usize>>
+where
+    F: Fn(usize) -> bool,
+{
     let metric = DotProduct;
     queries
         .iter()
@@ -205,19 +247,23 @@ fn exact_results(vectors: &[Vec<f32>], queries: &[Vec<f32>]) -> Vec<Vec<usize>> 
             let mut distances = vectors
                 .iter()
                 .enumerate()
+                .filter(|(id, _)| accepts(*id))
                 .map(|(id, vector)| (metric.distance(query, vector), id))
                 .collect::<Vec<_>>();
-            distances.select_nth_unstable_by(K, |left, right| {
+            if distances.len() > K {
+                distances.select_nth_unstable_by(K, |left, right| {
+                    left.0
+                        .total_cmp(&right.0)
+                        .then_with(|| left.1.cmp(&right.1))
+                });
+                distances.truncate(K);
+            }
+            distances.sort_unstable_by(|left, right| {
                 left.0
                     .total_cmp(&right.0)
                     .then_with(|| left.1.cmp(&right.1))
             });
-            distances[..K].sort_unstable_by(|left, right| {
-                left.0
-                    .total_cmp(&right.0)
-                    .then_with(|| left.1.cmp(&right.1))
-            });
-            distances[..K].iter().map(|(_, id)| *id).collect()
+            distances.iter().map(|(_, id)| *id).collect()
         })
         .collect()
 }

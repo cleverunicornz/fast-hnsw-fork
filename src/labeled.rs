@@ -54,6 +54,7 @@
 
 use std::io;
 use std::path::Path;
+use std::cell::RefCell;
 
 use crate::Builder;
 use crate::distance::Distance;
@@ -176,6 +177,29 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
             .collect()
     }
 
+    /// Search with filter-before-top-k eligibility over ids and payloads.
+    pub fn search_filtered<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> Vec<LabeledResult<'a, L>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
+        self.inner
+            .search_filtered(query, k, ef, |id| accepts(id, &self.payloads[id]))
+            .into_iter()
+            .map(|result| LabeledResult {
+                id: result.id,
+                distance: result.distance,
+                payload: &self.payloads[result.id],
+                embedding: self.inner.get_vector(result.id),
+            })
+            .collect()
+    }
+
     // ─── Direct access ────────────────────────────────────────────────────
 
     /// Retrieve the payload for a specific id.
@@ -270,6 +294,45 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
         self.inner
             .search(query, k, ef)
+            .into_iter()
+            .map(|result| {
+                Ok(MappedLabeledResult {
+                    id: result.id,
+                    distance: result.distance,
+                    payload: self.payloads.get(result.id)?,
+                    embedding: self.inner.get_vector(result.id),
+                })
+            })
+            .collect()
+    }
+
+    /// Search with filter-before-top-k eligibility over lazily decoded
+    /// fixed-width payloads.
+    pub fn search_filtered<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
+        let decode_error = RefCell::new(None);
+        let results = self.inner.search_filtered(query, k, ef, |id| {
+            match self.payloads.get(id) {
+                Ok(payload) => accepts(id, &payload),
+                Err(error) => {
+                    *decode_error.borrow_mut() = Some(error);
+                    false
+                }
+            }
+        });
+        if let Some(error) = decode_error.into_inner() {
+            return Err(error);
+        }
+
+        results
             .into_iter()
             .map(|result| {
                 Ok(MappedLabeledResult {

@@ -163,6 +163,47 @@ mod tests {
     }
 
     #[test]
+    fn filtered_search_applies_filter_before_top_k() {
+        let mut index = Builder::new()
+            .m(16)
+            .ef_construction(100)
+            .seed(44)
+            .build(Euclidean);
+        for id in 0..100 {
+            index.insert(vec![id as f32]);
+        }
+
+        let results = index.search_filtered(&[12.1], 3, 100, |id| id % 10 == 0);
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            [10, 20, 0]
+        );
+    }
+
+    #[test]
+    fn filtered_search_navigates_through_rejected_nodes() {
+        let mut index = Builder::new()
+            .m(16)
+            .ef_construction(100)
+            .seed(45)
+            .build(Euclidean);
+        for id in 0..100 {
+            index.insert(vec![id as f32]);
+        }
+
+        let results = index.search_filtered(&[0.0], 1, 100, |id| id == 99);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 99);
+    }
+
+    #[test]
+    fn filtered_search_handles_empty_eligibility_set() {
+        let index = build_index(100, 4, 46);
+        let results = index.search_filtered(&[0.5; 4], 10, 100, |_| false);
+        assert!(results.is_empty());
+    }
+
+    #[test]
     fn stored_vectors_are_retrievable() {
         let mut index = Builder::new().seed(5).build(Euclidean);
         let vecs = vec![vec![1.0f32, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
@@ -431,6 +472,9 @@ mod tests {
         for (a, b) in r_orig.iter().zip(r_mmap.iter()) {
             assert_eq!(a.id, b.id);
         }
+        let filtered_orig = orig.search_filtered(&q, 5, 200, |id| id % 7 == 0);
+        let filtered_mmap = mmap.search_filtered(&q, 5, 200, |id| id % 7 == 0);
+        assert_eq!(filtered_orig, filtered_mmap);
     }
 
     #[test]
@@ -485,6 +529,10 @@ mod tests {
         let hits = idx.search(&[0.1, 0.0], 1, 20);
         assert_eq!(hits[0].payload, &10_u32);
         assert_eq!(hits[0].id, 0);
+
+        let filtered = idx.search_filtered(&[0.1, 0.0], 2, 20, |_id, payload| *payload >= 20);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|result| *result.payload >= 20));
     }
 
     #[test]
@@ -618,6 +666,13 @@ mod tests {
         assert_eq!(hits[0].id, 12);
         assert_eq!(hits[0].payload, 120);
         assert_eq!(hits[0].embedding, &[12.0]);
+
+        let filtered = mmap
+            .search_filtered(&[12.0], 3, 30, |_id, payload| *payload % 40 == 0)
+            .expect("filtered search failed");
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].id, 12);
+        assert!(filtered.iter().all(|result| result.payload % 40 == 0));
     }
 
     #[test]

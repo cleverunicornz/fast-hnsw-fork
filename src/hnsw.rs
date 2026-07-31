@@ -472,6 +472,19 @@ impl Scratch {
     }
 
     #[inline]
+    fn push_navigation(&mut self, d: DistId) {
+        self.candidates.push(Reverse(d));
+    }
+
+    #[inline]
+    fn push_result(&mut self, d: DistId) {
+        self.results.push(d);
+        if self.results.len() > self.results_cap {
+            self.results.pop();
+        }
+    }
+
+    #[inline]
     fn pop_candidate(&mut self) -> Option<DistId> {
         self.candidates.pop().map(|Reverse(x)| x)
     }
@@ -935,6 +948,80 @@ impl<D: Distance> Hnsw<D> {
             .collect()
     }
 
+    /// Search while applying an eligibility predicate during layer-0
+    /// traversal.
+    ///
+    /// Rejected nodes remain navigation candidates, preserving connectivity
+    /// through mixed or highly selective graphs, but they never enter the
+    /// bounded result heap. Consequently `k` is applied to accepted nodes
+    /// rather than to an unfiltered top-k followed by post-filtering.
+    ///
+    /// The predicate receives the zero-based vector id. If fewer than `k`
+    /// accepted nodes are reachable, all accepted results found are returned.
+    pub fn search_filtered<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> bool,
+    {
+        assert!(k > 0, "k must be > 0");
+        let ef = ef.max(k);
+
+        let (ep_id, ep_level) = match self.entry_point {
+            None => return Vec::new(),
+            Some(entry_point) => entry_point,
+        };
+
+        let mut visited = VisitedTracker::new(self.vec_store.len());
+        let mut scratch = Scratch::new(ef);
+        let mut entry_points = Vec::with_capacity(ef);
+
+        let entry_distance = self.metric.distance(query, self.vec_store.get(ep_id));
+        entry_points.push(DistId::new(entry_distance, ep_id));
+
+        // Upper layers are navigation-only and deliberately ignore the
+        // eligibility predicate.
+        for layer in (1..=ep_level).rev() {
+            Self::do_search_layer(
+                &self.vec_store,
+                &self.graph,
+                &self.metric,
+                &mut visited,
+                &mut scratch,
+                query,
+                &entry_points,
+                1,
+                layer,
+            );
+            std::mem::swap(&mut entry_points, &mut scratch.out);
+        }
+
+        Self::do_search_layer_filtered(
+            &self.vec_store,
+            &self.graph,
+            &self.metric,
+            &mut visited,
+            &mut scratch,
+            query,
+            &entry_points,
+            ef,
+            &accepts,
+        );
+        scratch.out.truncate(k);
+        scratch
+            .out
+            .iter()
+            .map(|result| SearchResult {
+                id: result.id,
+                distance: result.dist,
+            })
+            .collect()
+    }
+
     #[inline] pub fn len(&self)              -> usize         { self.vec_store.len() }
     #[inline] pub fn is_empty(&self)         -> bool          { self.vec_store.len() == 0 }
     #[inline] pub fn get_vector(&self, id: usize) -> &[f32]  { self.vec_store.get(id) }
@@ -1027,6 +1114,62 @@ impl<D: Distance> Hnsw<D> {
                         let cur_worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
                         if nb_dist < cur_worst || scratch.results_len() < ef {
                             scratch.push_candidate(DistId::new(nb_dist, nb));
+                        }
+                    }
+                }
+            }
+        }
+        scratch.finish();
+    }
+
+    // ─── search_layer (filtered layer-0 search) ───────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_search_layer_filtered<F>(
+        vec_store: &VecStore,
+        graph: &GraphStore,
+        metric: &D,
+        visited: &mut VisitedTracker,
+        scratch: &mut Scratch,
+        query: &[f32],
+        entry_points: &[DistId],
+        ef: usize,
+        accepts: &F,
+    ) where
+        F: Fn(usize) -> bool,
+    {
+        visited.begin();
+        scratch.begin(ef);
+
+        for &entry in entry_points {
+            if visited.visit(entry.id) {
+                scratch.push_navigation(entry);
+                if accepts(entry.id) {
+                    scratch.push_result(entry);
+                }
+            }
+        }
+
+        while let Some(candidate) = scratch.pop_candidate() {
+            let worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
+            if scratch.results_len() >= ef && candidate.dist > worst {
+                break;
+            }
+
+            if let Some(neighbours) = graph.neighbours(candidate.id, 0) {
+                for (neighbour_id, _) in neighbours {
+                    let neighbour = neighbour_id as usize;
+                    if !visited.visit(neighbour) {
+                        continue;
+                    }
+
+                    let distance = metric.distance(query, vec_store.get(neighbour));
+                    let worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
+                    if scratch.results_len() < ef || distance < worst {
+                        let neighbour = DistId::new(distance, neighbour);
+                        scratch.push_navigation(neighbour);
+                        if accepts(neighbour.id) {
+                            scratch.push_result(neighbour);
                         }
                     }
                 }

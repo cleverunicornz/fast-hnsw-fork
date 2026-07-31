@@ -84,11 +84,26 @@ fn main() {
 |---|---|
 | `insert(Vec<f32>) -> usize` | Add a vector; returns its assigned id (0-based). |
 | `search(&[f32], k, ef) -> Vec<SearchResult>` | Return the `k` approximate nearest neighbours. |
+| `search_filtered(&[f32], k, ef, predicate)` | Apply id eligibility during traversal; rejected nodes remain navigable but never enter top-k. |
 | `get_vector(id) -> &[f32]` | Retrieve a stored vector by id. |
 | `len() / is_empty() / dim() / max_level()` | Index introspection. |
 | `stats() -> IndexStats` | Layer-by-layer node and edge counts. |
 
 ---
+
+---
+
+### In-traversal filtering
+
+```rust
+let hits = index.search_filtered(&query, 10, 512, |id| allowed_ids.contains(&id));
+```
+
+The predicate runs when a node is discovered at layer 0. Rejected nodes may
+still connect the traversal to eligible regions, but only accepted nodes enter
+the bounded result heap. This enforces filtering before top-k selection and
+avoids the short-result behavior of retrieving `k` globally and filtering
+afterward.
 
 ---
 

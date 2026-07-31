@@ -410,7 +410,7 @@ The storage overhead is 4 extra bytes per edge (8 bytes total vs 4 for a bare `u
 
 ---
 
-## Benchmark — ours vs. `hnsw_rs v0.3.3` and `hnsw v0.11` (rust-cv)
+## Benchmark — ours vs. `hnsw_rs v0.3.4` and `hnsw v0.11` (rust-cv)
 
 > **Setup:** M = 16 · ef\_construction = 200 · K = 10 · 500 queries · metric = L2(f32)
 > Single-threaded · release build · ground truth = brute-force exact L2.

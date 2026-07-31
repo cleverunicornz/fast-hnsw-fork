@@ -11,7 +11,7 @@
 //! | crate       | version | notes |
 //! |-------------|---------|-------|
 //! | ours        | (local) | this repo |
-//! | hnsw_rs     | 0.3.3   | Jean-Pierre Both; uses Rayon+RwLock internally |
+//! | hnsw_rs     | 0.3.4   | Jean-Pierre Both; uses Rayon+RwLock internally |
 //! | hnsw_ext    | 0.11.0  | rust-cv / Geordon Worley; const-generic M; external Searcher |
 //!
 //! ## JSONL schema (one object per line, one line per workload × library)
@@ -387,7 +387,7 @@ fn main() {
     );
     println!("Libraries:");
     println!("  ours     — this repository (pure Rust, M=16)");
-    println!("  hnsw_rs  — v0.3.3 by Jean-Pierre Both (Rayon/RwLock, inserts serialized)");
+    println!("  hnsw_rs  — v0.3.4 by Jean-Pierre Both (Rayon/RwLock, inserts serialized)");
     println!("  hnsw_v0  — v0.11.0 by Geordon Worley (const-generic M, external Searcher)");
     println!("Speedup rows: ▲ = ours faster, ▼ = ours slower.  pp = percentage-point recall delta.");
 

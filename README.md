@@ -19,7 +19,7 @@ cargo add fast-hnsw
 - **Full algorithmic fidelity** — heuristic (Algorithm 4) and simple (Algorithm 3) neighbour selection; `extendCandidates`; `keepPrunedConnections`
 - **Two pruning strategies** — `PruneStrategy::Simple` (default, fastest) and `PruneStrategy::Heuristic` (full Algorithm 4 for all edges, opt-in)
 - **Five built-in distance metrics** — Euclidean, Squared Euclidean, Cosine, Dot-product, Manhattan; add your own with a one-method trait
-- **Persistence** — binary file format; `save` / `load` / `load_mmap`; vector section sits at a fixed offset so it can be memory-mapped as a `&[f32]` slice
+- **Mmap-native persistence** — `load_mmap` traverses vectors and HNSW adjacency records directly from one read-only mapping; graph-sized heap reconstruction is not required
 - **Labeled index** — `LabeledIndex<D, L>` attaches a typed `Payload` to every vector (class label, text tag, secondary embedding, custom struct)
 - **Paired index** — `PairedIndex<A, B>` builds two independent HNSW graphs over the same items (text+image, query+doc); search from either side, retrieve both embeddings per result
 - **Custom payload** — implement two methods (`encode` / `decode`) to persist any type; fixed-stride types use a flat layout, variable-width types get an offset table
@@ -109,7 +109,7 @@ persist::save(&index, "index.hnsw")?;
 // Load (vectors copied into RAM)
 let loaded = persist::load("index.hnsw", Euclidean)?;
 
-// Load with memory-mapped vector section (zero RAM copy; OS manages pages)
+// Load with memory-mapped vectors and graph (no graph-sized heap copy)
 // Ideal for indexes larger than available RAM.
 // Insert into a mmap-backed index will panic.
 let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
@@ -127,7 +127,10 @@ let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
                 Payload data   [optional offset table] + raw encoded bytes
 ```
 
-The vector section always begins at byte 256 — a fixed, known offset — so `mmap + pointer arithmetic` gives a `&[f32]` slice with zero reformatting.
+The vector section always begins at byte 256, so `mmap + pointer arithmetic`
+gives a `&[f32]` slice with zero reformatting. Levels and connection offsets
+provide random access to variable-width adjacency records; search decodes each
+little-endian `(u32, f32)` edge as it traverses the mapped graph.
 
 ---
 
@@ -508,7 +511,7 @@ For every combination of **workload** (n=1k/10k/50k × dim=32/128) and **index t
 | Save MB/s | `file_size / save_time` |
 | Load time | Wall-clock time to read all bytes into RAM |
 | Load MB/s | `file_size / load_time` |
-| mmap time | Wall-clock time to map the file + deserialize graph (vector bytes **not** read) |
+| mmap time | Wall-clock time to map and validate graph bounds (vectors and adjacency records are not copied) |
 | mmap speedup | `load_time / mmap_time` |
 
 ### Save throughput

@@ -211,12 +211,26 @@ pub(crate) type OwnedGraph = Vec<Vec<Vec<Edge>>>;
 /// through [`GraphStore::neighbours`] so a read-only memory-mapped
 /// implementation can decode on-disk edges without changing the search
 /// algorithm or relying on the alignment/layout of `(u32, f32)`.
-pub(crate) struct GraphStore {
-    owned: OwnedGraph,
+pub(crate) enum GraphStore {
+    Owned(OwnedGraph),
+    Mapped(MappedGraph),
 }
 
-pub(crate) struct Neighbours<'a> {
-    inner: std::iter::Copied<std::slice::Iter<'a, Edge>>,
+pub(crate) struct MappedGraph {
+    mmap: Arc<memmap2::Mmap>,
+    levels_offset: usize,
+    offsets_offset: usize,
+    node_count: usize,
+}
+
+pub(crate) enum Neighbours<'a> {
+    Owned(std::iter::Copied<std::slice::Iter<'a, Edge>>),
+    Mapped(MappedNeighbours<'a>),
+}
+
+pub(crate) struct MappedNeighbours<'a> {
+    bytes: &'a [u8],
+    position: usize,
 }
 
 impl Iterator for Neighbours<'_> {
@@ -224,61 +238,152 @@ impl Iterator for Neighbours<'_> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next()
+        match self {
+            Self::Owned(inner) => inner.next(),
+            Self::Mapped(inner) => inner.next(),
+        }
     }
 
     #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        match self {
+            Self::Owned(inner) => inner.size_hint(),
+            Self::Mapped(inner) => inner.size_hint(),
+        }
     }
 }
 
 impl ExactSizeIterator for Neighbours<'_> {}
 
+impl Iterator for MappedNeighbours<'_> {
+    type Item = Edge;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let pair = self.bytes.get(self.position..self.position + 8)?;
+        self.position += 8;
+        let id = u32::from_le_bytes(pair[..4].try_into().unwrap());
+        let distance = f32::from_le_bytes(pair[4..].try_into().unwrap());
+        Some((id, distance))
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.bytes.len() - self.position) / 8;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for MappedNeighbours<'_> {}
+
 impl GraphStore {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            owned: Vec::with_capacity(capacity),
-        }
+        Self::Owned(Vec::with_capacity(capacity))
     }
 
     pub(crate) fn from_owned(owned: OwnedGraph) -> Self {
-        Self { owned }
+        Self::Owned(owned)
+    }
+
+    pub(crate) fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
+        levels_offset: usize,
+        node_count: usize,
+    ) -> Self {
+        Self::Mapped(MappedGraph {
+            mmap,
+            levels_offset,
+            offsets_offset: levels_offset + node_count * 4,
+            node_count,
+        })
     }
 
     #[inline]
     pub(crate) fn node_count(&self) -> usize {
-        self.owned.len()
+        match self {
+            Self::Owned(graph) => graph.len(),
+            Self::Mapped(graph) => graph.node_count,
+        }
     }
 
     #[inline]
     pub(crate) fn level_count(&self, node: usize) -> usize {
-        self.owned[node].len()
+        match self {
+            Self::Owned(graph) => graph[node].len(),
+            Self::Mapped(graph) => graph.level(node) + 1,
+        }
     }
 
     #[inline]
     pub(crate) fn neighbour_count(&self, node: usize, layer: usize) -> usize {
-        self.owned[node][layer].len()
+        match self.neighbours(node, layer) {
+            Some(neighbours) => neighbours.len(),
+            None => 0,
+        }
     }
 
     #[inline]
     pub(crate) fn neighbours(&self, node: usize, layer: usize) -> Option<Neighbours<'_>> {
-        self.owned
-            .get(node)
-            .and_then(|layers| layers.get(layer))
-            .map(|edges| Neighbours {
-                inner: edges.iter().copied(),
-            })
+        match self {
+            Self::Owned(graph) => graph
+                .get(node)
+                .and_then(|layers| layers.get(layer))
+                .map(|edges| Neighbours::Owned(edges.iter().copied())),
+            Self::Mapped(graph) => graph.neighbours(node, layer).map(Neighbours::Mapped),
+        }
     }
 
     #[inline]
     fn push_node(&mut self, connections: Vec<Vec<Edge>>) {
-        self.owned.push(connections);
+        match self {
+            Self::Owned(graph) => graph.push(connections),
+            Self::Mapped(_) => panic!("cannot insert into a memory-mapped (read-only) index"),
+        }
     }
 
     #[inline]
     fn neighbours_mut(&mut self, node: usize, layer: usize) -> &mut Vec<Edge> {
-        &mut self.owned[node][layer]
+        match self {
+            Self::Owned(graph) => &mut graph[node][layer],
+            Self::Mapped(_) => panic!("cannot mutate a memory-mapped (read-only) index"),
+        }
+    }
+}
+
+impl MappedGraph {
+    #[inline(always)]
+    fn level(&self, node: usize) -> usize {
+        let start = self.levels_offset + node * 4;
+        u32::from_le_bytes(self.mmap[start..start + 4].try_into().unwrap()) as usize
+    }
+
+    #[inline(always)]
+    fn node_offset(&self, node: usize) -> usize {
+        let start = self.offsets_offset + node * 8;
+        u64::from_le_bytes(self.mmap[start..start + 8].try_into().unwrap()) as usize
+    }
+
+    #[inline]
+    fn neighbours(&self, node: usize, layer: usize) -> Option<MappedNeighbours<'_>> {
+        if node >= self.node_count || layer > self.level(node) {
+            return None;
+        }
+
+        let mut position = self.node_offset(node);
+        for _ in 0..layer {
+            let count =
+                u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
+            position += 4 + count * 8;
+        }
+
+        let count =
+            u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
+        let start = position + 4;
+        let end = start + count * 8;
+        Some(MappedNeighbours {
+            bytes: &self.mmap[start..end],
+            position: 0,
+        })
     }
 }
 
@@ -617,7 +722,7 @@ impl<D: Distance> Hnsw<D> {
         config:      Config,
         metric:      D,
         vec_store:   VecStore,
-        connections: OwnedGraph,
+        graph:       GraphStore,
         entry_point: Option<(usize, usize)>,
         dim:         Option<usize>,
     ) -> Self {
@@ -628,7 +733,7 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store,
-            graph: GraphStore::from_owned(connections),
+            graph,
             entry_point,
             rng:        SmallRng::from_entropy(),
             dim,

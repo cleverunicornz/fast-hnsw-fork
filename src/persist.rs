@@ -97,7 +97,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::distance::Distance;
-use crate::hnsw::{Config, Hnsw, OwnedGraph, PruneStrategy, VecStore};
+use crate::hnsw::{Config, GraphStore, Hnsw, OwnedGraph, PruneStrategy, VecStore};
 use crate::payload::Payload;
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
@@ -255,15 +255,12 @@ where
 
 // ─── Public load (mmap) ──────────────────────────────────────────────────────
 
-/// Load an index from `path`, keeping vector data **memory-mapped**.
+/// Load an index from `path`, keeping vectors and graph **memory-mapped**.
 ///
-/// The vector section of the file is mapped read-only into the process
-/// address space; the OS page cache manages which pages are physically
-/// resident.  Subsequent `search()` calls trigger page faults only for the
-/// vectors they actually touch — ideal for indexes larger than RAM.
-///
-/// The graph structure (connections, levels) is still deserialized into heap
-/// memory because it is variable-width.
+/// Vectors, levels, connection offsets, and adjacency records remain in the
+/// read-only file mapping. The OS page cache manages which pages are resident;
+/// search decodes little-endian edge records directly as it traverses them.
+/// No graph-sized heap allocation or adjacency-list deserialization occurs.
 ///
 /// ## Behaviour
 /// * Inserts into a mmap-backed index will panic (it is read-only).
@@ -275,8 +272,8 @@ pub fn load_mmap<D: Distance>(path: impl AsRef<Path>, metric: D) -> io::Result<H
 
 /// Mmap-load an index **and** its payload.
 ///
-/// The vector section stays memory-mapped (no heap copy).  Payload entries
-/// are decoded from the existing mapping — no second `File::open` or seek.
+/// Vectors and graph stay memory-mapped (no heap copy). Payload entries are
+/// decoded from the existing mapping — no second `File::open` or seek.
 pub fn load_mmap_with_payload<D, L>(
     path:   impl AsRef<Path>,
     metric: D,
@@ -432,13 +429,20 @@ fn read_hnsw_owned<D: Distance, R: Read + Seek>(
     // ── Graph ─────────────────────────────────────────────────────────────
     let (connections, payload_pos) = read_graph(r, n)?;
 
-    let index = Hnsw::from_parts(cfg, metric, vs, connections, ep, if dim == 0 { None } else { Some(dim) });
+    let index = Hnsw::from_parts(
+        cfg,
+        metric,
+        vs,
+        GraphStore::from_owned(connections),
+        ep,
+        if dim == 0 { None } else { Some(dim) },
+    );
     Ok((index, payload_pos))
 }
 
 // ─── Core read (mmap) ────────────────────────────────────────────────────────
 
-/// Open `file`, mmap its vector section, and deserialize the graph.
+/// Open `file` and keep its vectors and graph in one read-only mapping.
 ///
 /// Returns `(index, payload_section_start, arc_mmap)`.  The `Arc<Mmap>` is
 /// provided so the caller can read the payload section from the existing
@@ -472,11 +476,20 @@ fn read_hnsw_mmap_inner<D: Distance>(
 
     let vs = VecStore::from_mmap(Arc::clone(&mmap), vec_offset, n, dim);
 
-    // Graph lives after the vector section — read with the cursor.
-    cursor.seek(SeekFrom::Start((vec_offset + vec_bytes) as u64))?;
-    let (connections, payload_pos) = read_graph(&mut cursor, n)?;
+    // Levels, offsets, and adjacency records remain in the mapping. Validate
+    // their bounds once at open, then let search decode edge pairs lazily.
+    let levels_offset = vec_offset + vec_bytes;
+    let payload_pos = validate_mapped_graph(&mmap, levels_offset, n)?;
+    let graph = GraphStore::from_mmap(Arc::clone(&mmap), levels_offset, n);
 
-    let index = Hnsw::from_parts(cfg, metric, vs, connections, ep, if dim == 0 { None } else { Some(dim) });
+    let index = Hnsw::from_parts(
+        cfg,
+        metric,
+        vs,
+        graph,
+        ep,
+        if dim == 0 { None } else { Some(dim) },
+    );
     Ok((index, payload_pos, mmap))
 }
 
@@ -624,6 +637,81 @@ fn read_graph<R: Read + Seek>(
     // The payload header begins right after the connection data.
     let payload_pos = r.stream_position()?;
     Ok((connections, payload_pos))
+}
+
+/// Validate the memory-mapped graph tables and records without materializing
+/// adjacency lists. Returns the byte offset of the payload section.
+fn validate_mapped_graph(
+    mmap: &[u8],
+    levels_offset: usize,
+    n: usize,
+) -> io::Result<u64> {
+    let levels_bytes = n.checked_mul(4).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "levels table size overflow")
+    })?;
+    let offsets_bytes = n.checked_mul(8).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "offset table size overflow")
+    })?;
+    let offsets_offset = levels_offset.checked_add(levels_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "offset table position overflow")
+    })?;
+    let data_offset = offsets_offset.checked_add(offsets_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "graph data position overflow")
+    })?;
+    if data_offset > mmap.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: graph tables extend past end of file",
+        ));
+    }
+
+    let mut position = data_offset;
+    for node in 0..n {
+        let level_pos = levels_offset + node * 4;
+        let level = u32::from_le_bytes(
+            mmap[level_pos..level_pos + 4].try_into().unwrap(),
+        ) as usize;
+
+        let offset_pos = offsets_offset + node * 8;
+        let recorded = u64::from_le_bytes(
+            mmap[offset_pos..offset_pos + 8].try_into().unwrap(),
+        );
+        if recorded != position as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid connection offset for node {node}: {recorded} != {position}"
+                ),
+            ));
+        }
+
+        for _ in 0..=level {
+            let count_end = position.checked_add(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection position overflow")
+            })?;
+            let count_bytes = mmap.get(position..count_end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file too short: missing connection count",
+                )
+            })?;
+            let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+            let edge_bytes = count.checked_mul(8).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection list size overflow")
+            })?;
+            position = count_end.checked_add(edge_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection position overflow")
+            })?;
+            if position > mmap.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file too short: connection list extends past end of file",
+                ));
+            }
+        }
+    }
+
+    Ok(position as u64)
 }
 
 // ─── Payload I/O ─────────────────────────────────────────────────────────────

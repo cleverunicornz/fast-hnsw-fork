@@ -416,6 +416,10 @@ mod tests {
         persist::save(&orig, &path).expect("save failed");
 
         let mmap = persist::load_mmap(&path, Euclidean).expect("mmap load failed");
+        assert!(matches!(
+            &mmap.graph,
+            crate::hnsw::GraphStore::Mapped(_)
+        ));
         assert_eq!(orig.len(), mmap.len());
         for i in 0..orig.len() {
             assert_eq!(orig.get_vector(i), mmap.get_vector(i),
@@ -427,6 +431,34 @@ mod tests {
         for (a, b) in r_orig.iter().zip(r_mmap.iter()) {
             assert_eq!(a.id, b.id);
         }
+    }
+
+    #[test]
+    fn persist_mmap_rejects_invalid_graph_offset() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 302);
+        let dir = tempdir();
+        let path = dir.join("bad_graph_offset.hnsw");
+        persist::save(&index, &path).expect("save failed");
+
+        let offsets_start = 256 + n * dim * 4 + n * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(offsets_start as u64))
+            .expect("seek failed");
+        file.write_all(&0u64.to_le_bytes()).expect("write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("invalid graph offset should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid connection offset"));
     }
 
     #[test]

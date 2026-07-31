@@ -2,7 +2,8 @@
 //!
 //! Example:
 //!   cargo bench --bench fvecs -- \
-//!     --fvecs /path/to/minilm.fvecs --rows 10000 --queries 100
+//!     --fvecs /path/to/minilm.fvecs --rows 10000 --queries 100 \
+//!     --snapshot /tmp/minilm.hnsw
 
 use fast_hnsw::distance::{Distance, DotProduct};
 use fast_hnsw::{Builder, Hnsw, persist};
@@ -22,6 +23,7 @@ struct Args {
     ef_construction: usize,
     ef_search: usize,
     seed: u64,
+    snapshot: Option<PathBuf>,
 }
 
 fn main() -> io::Result<()> {
@@ -64,11 +66,14 @@ fn main() -> io::Result<()> {
         approximate.push(result.into_iter().map(|item| item.id).collect::<Vec<_>>());
     }
 
-    let snapshot = std::env::temp_dir().join(format!(
-        "fast-hnsw-fvecs-{}-{}.hnsw",
-        std::process::id(),
-        args.seed
-    ));
+    let temporary_snapshot = args.snapshot.is_none();
+    let snapshot = args.snapshot.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "fast-hnsw-fvecs-{}-{}.hnsw",
+            std::process::id(),
+            args.seed
+        ))
+    });
     let started = Instant::now();
     persist::save(&index, &snapshot)?;
     let save = started.elapsed();
@@ -83,7 +88,9 @@ fn main() -> io::Result<()> {
     if reopened_result.is_empty() {
         return Err(io::Error::other("reopened index returned no results"));
     }
-    std::fs::remove_file(&snapshot)?;
+    if temporary_snapshot {
+        std::fs::remove_file(&snapshot)?;
+    }
 
     println!("{{");
     println!("  \"corpus\": {:?},", args.fvecs.display().to_string());
@@ -113,7 +120,15 @@ fn main() -> io::Result<()> {
         "  \"first_query_us\": {:.6},",
         microseconds(first_query)
     );
-    println!("  \"disk_bytes\": {disk_bytes}");
+    if temporary_snapshot {
+        println!("  \"disk_bytes\": {disk_bytes}");
+    } else {
+        println!("  \"disk_bytes\": {disk_bytes},");
+        println!(
+            "  \"snapshot\": {:?}",
+            snapshot.display().to_string()
+        );
+    }
     println!("}}");
     Ok(())
 }
@@ -249,6 +264,7 @@ fn parse_args() -> io::Result<Args> {
         ef_construction: parse_arg(&args, "--ef-construction")?.unwrap_or(256),
         ef_search: parse_arg(&args, "--ef-search")?.unwrap_or(512),
         seed: parse_arg(&args, "--seed")?.unwrap_or(0x4e4f_5641),
+        snapshot: optional_arg(&args, "--snapshot")?.map(PathBuf::from),
     })
 }
 
@@ -272,6 +288,16 @@ fn required_arg<'a>(args: &'a [String], flag: &str) -> io::Result<&'a str> {
         .ok_or_else(|| invalid_input(format!("missing {flag}")))?;
     args.get(position + 1)
         .map(String::as_str)
+        .ok_or_else(|| invalid_input(format!("{flag} requires a value")))
+}
+
+fn optional_arg<'a>(args: &'a [String], flag: &str) -> io::Result<Option<&'a str>> {
+    let Some(position) = args.iter().position(|argument| argument == flag) else {
+        return Ok(None);
+    };
+    args.get(position + 1)
+        .map(String::as_str)
+        .map(Some)
         .ok_or_else(|| invalid_input(format!("{flag} requires a value")))
 }
 

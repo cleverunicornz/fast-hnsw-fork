@@ -43,6 +43,11 @@ name = "fvecs"
 path = "benches/fvecs.rs"
 harness = false
 
+[[bench]]
+name = "mmap_fvecs"
+path = "benches/mmap_fvecs.rs"
+harness = false
+
 [[example]]
 name = "demo"
 path = "examples/demo.rs"

@@ -579,6 +579,15 @@ cargo bench --bench compare -- --full      # scale to 1 M  (~hours)
 cargo bench --bench persist                # default workloads (≤ 50k)
 cargo bench --bench persist -- --full      # scale to 1 M  (~hours)
 
+# Real-embedding recall and retained mmap snapshot
+cargo bench --bench fvecs -- \
+  --fvecs /path/to/corpus.fvecs --rows 100000 --queries 100 \
+  --snapshot /tmp/corpus.hnsw
+
+# Process-isolated mmap open/query timing (wrap with the platform RSS tool)
+/usr/bin/time -l target/release/deps/mmap_fvecs-<hash> \
+  --index /tmp/corpus.hnsw --fvecs /path/to/corpus.fvecs --queries 100
+
 # Regenerate all figures
 python3 figures/plot_bench.py              # bench_fig1–4
 python3 figures/plot_benchmarks.py         # fig1–7 (3-library comparison)
@@ -607,7 +616,9 @@ hnsw/
 ├── benches/
 │   ├── bench.rs        Standalone wall-clock timing (ours only); writes bench.jsonl
 │   ├── compare.rs      3-library comparison (ours/hnsw_rs/hnsw v0.11); writes compare.jsonl
-│   └── persist.rs      Save / load / mmap-load timing + file sizes; writes persist.csv
+│   ├── persist.rs      Save / load / mmap-load timing + file sizes; writes persist.csv
+│   ├── fvecs.rs        Real-embedding recall + retained snapshot lifecycle gate
+│   └── mmap_fvecs.rs   Process-isolated mapped-open/query profile
 ├── examples/
 │   ├── demo.rs         Core HNSW walkthrough
 │   └── store.rs        Persistence + LabeledIndex + PairedIndex demos

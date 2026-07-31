@@ -236,6 +236,15 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         persist::save_with_payload(&self.inner, &self.payloads, path)
     }
 
+    /// Serialize a compact snapshot for read-only mmap serving.
+    ///
+    /// The compact format stores only neighbour ids in adjacency lists. Open
+    /// it with [`load_mmap`](Self::load_mmap) or
+    /// [`load_mmap_fixed`](Self::load_mmap_fixed), not [`load`](Self::load).
+    pub fn save_compact(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        persist::save_compact_with_payload(&self.inner, &self.payloads, path)
+    }
+
     /// Load a labeled index from a file, copying vector data into RAM.
     ///
     /// Use this for indexes that fit comfortably in memory.

@@ -42,6 +42,7 @@ struct Args {
     queries: usize,
     ef_search: usize,
     filter_modulo: Option<usize>,
+    compact_output: Option<PathBuf>,
 }
 
 fn main() -> io::Result<()> {
@@ -98,8 +99,27 @@ fn main() -> io::Result<()> {
     let allocated_reused_search = allocation_snapshot();
     let directed_edges = index.stats().layer_edges.into_iter().sum::<usize>();
     let snapshot_bytes = args.index.metadata()?.len();
-    let compact_id_only_bytes =
-        snapshot_bytes.saturating_sub((directed_edges as u64).saturating_mul(4));
+    let snapshot_version = read_snapshot_version(&args.index)?;
+    let compact_id_only_bytes = if snapshot_version == 1 {
+        snapshot_bytes.saturating_sub((directed_edges as u64).saturating_mul(4))
+    } else {
+        snapshot_bytes
+    };
+    let compact_result = if let Some(path) = &args.compact_output {
+        let started = Instant::now();
+        persist::save_compact(&index, path)?;
+        let save = started.elapsed();
+        let bytes = path.metadata()?.len();
+        let started = Instant::now();
+        let compact = persist::load_mmap(path, DotProduct)?;
+        let open = started.elapsed();
+        if compact.len() != index.len() {
+            return Err(io::Error::other("compact snapshot row count differs"));
+        }
+        Some((path, save, open, bytes))
+    } else {
+        None
+    };
 
     println!("{{");
     println!("  \"index\": {:?},", args.index.display().to_string());
@@ -149,8 +169,20 @@ fn main() -> io::Result<()> {
         allocated_reused_search.bytes
     );
     println!("  \"directed_edges\": {directed_edges},");
+    println!("  \"snapshot_version\": {snapshot_version},");
     println!("  \"snapshot_bytes\": {snapshot_bytes},");
-    println!("  \"estimated_id_only_edge_snapshot_bytes\": {compact_id_only_bytes}");
+    match compact_result {
+        Some((path, save, open, bytes)) => {
+            println!("  \"estimated_id_only_edge_snapshot_bytes\": {compact_id_only_bytes},");
+            println!("  \"compact_snapshot\": {:?},", path.display().to_string());
+            println!("  \"compact_save_ms\": {:.6},", milliseconds(save));
+            println!("  \"compact_open_ms\": {:.6},", milliseconds(open));
+            println!("  \"compact_snapshot_bytes\": {bytes}");
+        }
+        None => {
+            println!("  \"estimated_id_only_edge_snapshot_bytes\": {compact_id_only_bytes}");
+        }
+    }
     println!("}}");
     Ok(())
 }
@@ -296,6 +328,14 @@ fn microseconds(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
 
+fn read_snapshot_version(path: &Path) -> io::Result<u32> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(8))?;
+    let mut bytes = [0; 4];
+    file.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 fn parse_args() -> io::Result<Args> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let filter_modulo = parse_arg(&args, "--filter-modulo")?;
@@ -308,6 +348,7 @@ fn parse_args() -> io::Result<Args> {
         queries: parse_arg(&args, "--queries")?.unwrap_or(100),
         ef_search: parse_arg(&args, "--ef-search")?.unwrap_or(512),
         filter_modulo,
+        compact_output: optional_arg(&args, "--compact-output")?.map(PathBuf::from),
     })
 }
 
@@ -331,6 +372,16 @@ fn required_arg<'a>(args: &'a [String], flag: &str) -> io::Result<&'a str> {
         .ok_or_else(|| invalid_input(format!("missing {flag}")))?;
     args.get(position + 1)
         .map(String::as_str)
+        .ok_or_else(|| invalid_input(format!("{flag} requires a value")))
+}
+
+fn optional_arg<'a>(args: &'a [String], flag: &str) -> io::Result<Option<&'a str>> {
+    let Some(position) = args.iter().position(|argument| argument == flag) else {
+        return Ok(None);
+    };
+    args.get(position + 1)
+        .map(String::as_str)
+        .map(Some)
         .ok_or_else(|| invalid_input(format!("{flag} requires a value")))
 }
 

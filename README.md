@@ -139,6 +139,9 @@ let mut index = Builder::new().m(16).ef_construction(200).build(Euclidean);
 // Save
 persist::save(&index, "index.hnsw")?;
 
+// Save a smaller read-only serving snapshot (ID-only adjacency records)
+persist::save_compact(&index, "index.compact.hnsw")?;
+
 // Load (vectors copied into RAM)
 let loaded = persist::load("index.hnsw", Euclidean)?;
 
@@ -146,7 +149,14 @@ let loaded = persist::load("index.hnsw", Euclidean)?;
 // Ideal for indexes larger than available RAM.
 // Insert into a mmap-backed index will panic.
 let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
+let compact_mmap = persist::load_mmap("index.compact.hnsw", Euclidean)?;
 ```
+
+The default v1 format preserves build-time edge distances and supports owned,
+mutable reloads. The compact v2 format drops those distances because query
+traversal recomputes distances from vectors; it uses four bytes per directed
+edge instead of eight and is deliberately mmap/read-only. Existing v1 files
+remain fully compatible.
 
 ### File format
 
@@ -155,7 +165,8 @@ let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
 [256 .. ]       Vectors        n × dim × 4 bytes (f32 LE, row-major) ← mmap-able
 [after vecs]    Levels         n × u32 — layer count per node
 [after levels]  Conn offsets   n × u64 — absolute byte offsets into conn data
-[at offsets]    Conn data      per-node: per-layer u32 count + (u32,f32) pairs
+[at offsets]    Conn data      v1: per-layer count + (u32,f32) pairs
+                                v2: per-layer count + u32 neighbor ids
 [after graph]   Payload hdr    payload_count · stride (0 = variable)
                 Payload data   [optional offset table] + raw encoded bytes
 ```
@@ -163,7 +174,7 @@ let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
 The vector section always begins at byte 256, so `mmap + pointer arithmetic`
 gives a `&[f32]` slice with zero reformatting. Levels and connection offsets
 provide random access to variable-width adjacency records; search decodes each
-little-endian `(u32, f32)` edge as it traverses the mapped graph.
+little-endian edge as it traverses the mapped graph.
 
 ---
 

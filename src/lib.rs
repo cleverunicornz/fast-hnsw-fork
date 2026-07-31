@@ -506,6 +506,151 @@ mod tests {
     }
 
     #[test]
+    fn compact_snapshot_is_smaller_and_search_equivalent() {
+        let (orig, _) = make_hnsw(200, 16, 303);
+        let dir = tempdir();
+        let v1_path = dir.join("full-v1.hnsw");
+        let v2_path = dir.join("compact-v2.hnsw");
+        persist::save(&orig, &v1_path).expect("v1 save failed");
+
+        // Re-encoding an existing mmap snapshot is an important production
+        // path: compacting does not require rebuilding the graph.
+        let v1_mmap =
+            persist::load_mmap(&v1_path, Euclidean).expect("v1 mmap load failed");
+        persist::save_compact(&v1_mmap, &v2_path).expect("v2 save failed");
+
+        let mut edge_count = 0;
+        for node in 0..orig.graph.node_count() {
+            for layer in 0..orig.graph.level_count(node) {
+                edge_count += orig.graph.neighbour_count(node, layer);
+            }
+        }
+        let v1_bytes = std::fs::metadata(&v1_path).expect("v1 metadata failed").len();
+        let v2_bytes = std::fs::metadata(&v2_path).expect("v2 metadata failed").len();
+        assert_eq!(v1_bytes - v2_bytes, edge_count as u64 * 4);
+
+        let compact =
+            persist::load_mmap(&v2_path, Euclidean).expect("v2 mmap load failed");
+        assert_eq!(orig.len(), compact.len());
+        for i in 0..orig.len() {
+            assert_eq!(orig.get_vector(i), compact.get_vector(i));
+        }
+
+        let query = vec![0.3f32; 16];
+        assert_eq!(
+            orig.search(&query, 10, 100),
+            compact.search(&query, 10, 100)
+        );
+        assert_eq!(
+            orig.search_filtered(&query, 10, 200, |id| id % 7 == 0),
+            compact.search_filtered(&query, 10, 200, |id| id % 7 == 0)
+        );
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_owned_load() {
+        let (index, _) = make_hnsw(20, 8, 304);
+        let dir = tempdir();
+        let path = dir.join("compact-owned.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let error = persist::load(&path, Euclidean)
+            .err()
+            .expect("owned compact load should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read-only"));
+        assert!(error.to_string().contains("load_mmap"));
+    }
+
+    #[test]
+    fn compact_snapshot_supports_variable_and_fixed_payloads() {
+        let (index, _) = make_hnsw(30, 8, 305);
+        let dir = tempdir();
+
+        let string_path = dir.join("compact-strings.hnsw");
+        let strings: Vec<String> = (0..index.len()).map(|id| format!("item-{id}")).collect();
+        persist::save_compact_with_payload(&index, &strings, &string_path)
+            .expect("compact variable payload save failed");
+        let (string_index, loaded_strings) =
+            persist::load_mmap_with_payload::<_, String>(&string_path, Euclidean)
+                .expect("compact variable payload mmap load failed");
+        assert_eq!(loaded_strings, strings);
+        assert_eq!(string_index.len(), index.len());
+
+        let fixed_path = dir.join("compact-u32.hnsw");
+        let labels: Vec<u32> = (0..index.len() as u32).map(|id| id * 10).collect();
+        persist::save_compact_with_payload(&index, &labels, &fixed_path)
+            .expect("compact fixed payload save failed");
+        let (fixed_index, mapped_labels) =
+            persist::load_mmap_with_fixed_payload::<_, u32>(&fixed_path, Euclidean)
+                .expect("compact fixed payload mmap load failed");
+        assert_eq!(fixed_index.len(), index.len());
+        for (id, expected) in labels.iter().copied().enumerate() {
+            assert_eq!(mapped_labels.get(id).expect("payload decode failed"), expected);
+        }
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_truncated_adjacency() {
+        let (index, _) = make_hnsw(20, 8, 306);
+        let dir = tempdir();
+        let path = dir.join("compact-truncated.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        let len = file.metadata().expect("metadata failed").len();
+        file.set_len(len - 17).expect("truncate failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("truncated compact adjacency should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("connection list"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_out_of_range_neighbour() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 307);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-neighbour.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let offsets_start = 256 + n * dim * 4 + n * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(offsets_start as u64))
+            .expect("seek failed");
+        let mut offset = [0; 8];
+        file.read_exact(&mut offset).expect("offset read failed");
+        let first_record = u64::from_le_bytes(offset);
+        file.seek(SeekFrom::Start(first_record))
+            .expect("record seek failed");
+        let mut count = [0; 4];
+        file.read_exact(&mut count).expect("count read failed");
+        assert!(u32::from_le_bytes(count) > 0);
+        file.write_all(&(n as u32).to_le_bytes())
+            .expect("neighbour write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("out-of-range neighbour should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid neighbour id"));
+    }
+
+    #[test]
     fn persist_mmap_rejects_invalid_graph_offset() {
         use std::io::{Seek, SeekFrom, Write};
 

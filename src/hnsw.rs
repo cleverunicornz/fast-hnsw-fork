@@ -194,14 +194,18 @@ impl VecStore {
     }
 
     /// Returns the whole vector section as a flat byte slice (for writing).
-    /// Only valid in owned mode.
     pub(crate) fn as_bytes(&self) -> &[u8] {
+        let (ptr, len) = match &self.mmap {
+            None => (self.data.as_ptr(), self.data.len()),
+            Some(mb) => (mb.ptr, mb.len),
+        };
         // SAFETY: f32 has no padding; any bit pattern is valid; alignment is
-        // satisfied because we're converting &[f32] → &[u8].
+        // satisfied because both owned and mapped vector sections are
+        // represented as aligned f32 storage.
         unsafe {
             std::slice::from_raw_parts(
-                self.data.as_ptr() as *const u8,
-                self.data.len() * std::mem::size_of::<f32>(),
+                ptr as *const u8,
+                len * std::mem::size_of::<f32>(),
             )
         }
     }
@@ -228,6 +232,7 @@ pub(crate) struct MappedGraph {
     levels_offset: usize,
     offsets_offset: usize,
     node_count: usize,
+    edge_stride: usize,
 }
 
 pub(crate) enum Neighbours<'a> {
@@ -238,6 +243,7 @@ pub(crate) enum Neighbours<'a> {
 pub(crate) struct MappedNeighbours<'a> {
     bytes: &'a [u8],
     position: usize,
+    edge_stride: usize,
 }
 
 impl Iterator for Neighbours<'_> {
@@ -267,16 +273,24 @@ impl Iterator for MappedNeighbours<'_> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        let pair = self.bytes.get(self.position..self.position + 8)?;
-        self.position += 8;
-        let id = u32::from_le_bytes(pair[..4].try_into().unwrap());
-        let distance = f32::from_le_bytes(pair[4..].try_into().unwrap());
+        let edge = self
+            .bytes
+            .get(self.position..self.position + self.edge_stride)?;
+        self.position += self.edge_stride;
+        let id = u32::from_le_bytes(edge[..4].try_into().unwrap());
+        // Compact snapshots omit build-time edge distances. Search computes
+        // query-to-node distances from vectors and never consumes this value.
+        let distance = if self.edge_stride == 8 {
+            f32::from_le_bytes(edge[4..8].try_into().unwrap())
+        } else {
+            0.0
+        };
         Some((id, distance))
     }
 
     #[inline(always)]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.bytes.len() - self.position) / 8;
+        let remaining = (self.bytes.len() - self.position) / self.edge_stride;
         (remaining, Some(remaining))
     }
 }
@@ -296,12 +310,14 @@ impl GraphStore {
         mmap: Arc<memmap2::Mmap>,
         levels_offset: usize,
         node_count: usize,
+        edge_stride: usize,
     ) -> Self {
         Self::Mapped(MappedGraph {
             mmap,
             levels_offset,
             offsets_offset: levels_offset + node_count * 4,
             node_count,
+            edge_stride,
         })
     }
 
@@ -380,16 +396,17 @@ impl MappedGraph {
         for _ in 0..layer {
             let count =
                 u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
-            position += 4 + count * 8;
+            position += 4 + count * self.edge_stride;
         }
 
         let count =
             u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
         let start = position + 4;
-        let end = start + count * 8;
+        let end = start + count * self.edge_stride;
         Some(MappedNeighbours {
             bytes: &self.mmap[start..end],
             position: 0,
+            edge_stride: self.edge_stride,
         })
     }
 }

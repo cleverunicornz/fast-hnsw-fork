@@ -93,12 +93,61 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::distance::Distance;
 use crate::hnsw::{Config, GraphStore, Hnsw, OwnedGraph, PruneStrategy, VecStore};
 use crate::payload::Payload;
+
+/// Lazy, read-only view over a fixed-width payload column in an index mmap.
+///
+/// Values are decoded on access from their little-endian wire representation;
+/// the full payload column is never copied into a `Vec<L>`.
+pub struct MappedPayloads<L: Payload> {
+    mmap: Arc<memmap2::Mmap>,
+    data_offset: usize,
+    count: usize,
+    stride: usize,
+    marker: PhantomData<L>,
+}
+
+impl<L: Payload> MappedPayloads<L> {
+    /// Number of payload entries.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the payload column is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Decode one payload directly from the mapped file.
+    pub fn get(&self, id: usize) -> io::Result<L> {
+        if id >= self.count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("payload id {id} out of bounds for {} entries", self.count),
+            ));
+        }
+        let start = self.data_offset + id * self.stride;
+        let end = start + self.stride;
+        let (payload, consumed) = L::decode(&self.mmap[start..end])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if consumed != self.stride {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "fixed payload decoder consumed {consumed} bytes; expected {}",
+                    self.stride
+                ),
+            ));
+        }
+        Ok(payload)
+    }
+}
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 
@@ -294,6 +343,29 @@ where
     // at the wrong position (offset + payload_start bytes into the mmap).
     let mut cursor = io::Cursor::new(mmap.as_ref() as &[u8]);
     let payloads = read_payloads::<L, _>(&mut cursor, index.len(), payload_start)?;
+    Ok((index, payloads))
+}
+
+/// Mmap-load an index and retain a fixed-width payload column in the mapping.
+///
+/// Unlike [`load_mmap_with_payload`], this function does not allocate or
+/// decode a `Vec<L>` at open. Use [`MappedPayloads::get`] to decode individual
+/// values. Variable-width payload types are rejected.
+pub fn load_mmap_with_fixed_payload<D, L>(
+    path: impl AsRef<Path>,
+    metric: D,
+) -> io::Result<(Hnsw<D>, MappedPayloads<L>)>
+where
+    D: Distance,
+    L: Payload,
+{
+    let file = File::open(path.as_ref())?;
+    let (index, payload_start, mmap) = read_hnsw_mmap_inner(file, metric)?;
+    let payloads = map_fixed_payloads::<L>(
+        Arc::clone(&mmap),
+        payload_start,
+        index.len(),
+    )?;
     Ok((index, payloads))
 }
 
@@ -715,6 +787,80 @@ fn validate_mapped_graph(
 }
 
 // ─── Payload I/O ─────────────────────────────────────────────────────────────
+
+fn map_fixed_payloads<L: Payload>(
+    mmap: Arc<memmap2::Mmap>,
+    payload_section_pos: u64,
+    expected_count: usize,
+) -> io::Result<MappedPayloads<L>> {
+    let payload_section_pos = usize::try_from(payload_section_pos).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload section position does not fit in memory",
+        )
+    })?;
+    let header_end = payload_section_pos.checked_add(16).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload header position overflow")
+    })?;
+    let header = mmap.get(payload_section_pos..header_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: missing payload header",
+        )
+    })?;
+    let count = usize::try_from(read_u64(header, 0)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload count does not fit in memory",
+        )
+    })?;
+    let stride = usize::try_from(read_u64(header, 8)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stride does not fit in memory",
+        )
+    })?;
+
+    if count != expected_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload count {count} != index size {expected_count}"),
+        ));
+    }
+    let expected_stride = L::fixed_stride().filter(|stride| *stride > 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mapped payload access requires a non-zero fixed-width Payload",
+        )
+    })?;
+    if stride != expected_stride {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload stride {stride} != type stride {expected_stride}"),
+        ));
+    }
+
+    let payload_bytes = count.checked_mul(stride).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload column size overflow")
+    })?;
+    let data_end = header_end.checked_add(payload_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload column position overflow")
+    })?;
+    if data_end > mmap.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: fixed payload column extends past end of file",
+        ));
+    }
+
+    Ok(MappedPayloads {
+        mmap,
+        data_offset: header_end,
+        count,
+        stride,
+        marker: PhantomData,
+    })
+}
 
 /// Write a zero-entry payload section (marker for "no payload").
 pub(crate) fn write_empty_payload<W: Write>(w: &mut W) -> io::Result<()> {

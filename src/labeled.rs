@@ -59,7 +59,7 @@ use crate::Builder;
 use crate::distance::Distance;
 use crate::hnsw::{Config, Hnsw};
 use crate::payload::Payload;
-use crate::persist;
+use crate::persist::{self, MappedPayloads};
 
 // ─── Result type ─────────────────────────────────────────────────────────────
 
@@ -72,6 +72,17 @@ pub struct LabeledResult<'a, L> {
     /// Reference to the payload associated with this vector.
     pub payload:   &'a L,
     /// The stored vector (borrowed from the index).
+    pub embedding: &'a [f32],
+}
+
+/// One result from a [`MappedLabeledIndex`] search.
+///
+/// Fixed-width payloads are decoded from the mmap into the owned `payload`
+/// field; vectors remain borrowed from the mapping.
+pub struct MappedLabeledResult<'a, L> {
+    pub id: usize,
+    pub distance: f32,
+    pub payload: L,
     pub embedding: &'a [f32],
 }
 
@@ -220,6 +231,72 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     pub fn load_mmap(path: impl AsRef<Path>, metric: D) -> io::Result<Self> {
         let (inner, payloads) = persist::load_mmap_with_payload(path, metric)?;
         Ok(Self { inner, payloads })
+    }
+
+    /// Load vectors, graph, and a non-zero fixed-width payload column from one
+    /// read-only mapping.
+    ///
+    /// Payload values are decoded individually when accessed, avoiding the
+    /// `Vec<L>` allocation performed by [`load_mmap`](Self::load_mmap).
+    /// Variable-width payload types return [`io::ErrorKind::InvalidInput`].
+    pub fn load_mmap_fixed(
+        path: impl AsRef<Path>,
+        metric: D,
+    ) -> io::Result<MappedLabeledIndex<D, L>> {
+        MappedLabeledIndex::load(path, metric)
+    }
+}
+
+/// Read-only labeled index whose vectors, graph, and fixed-width payload
+/// column share one file mapping.
+pub struct MappedLabeledIndex<D: Distance, L: Payload> {
+    pub inner: Hnsw<D>,
+    payloads: MappedPayloads<L>,
+}
+
+impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
+    /// Open a fixed-width labeled index without materializing its payloads.
+    pub fn load(path: impl AsRef<Path>, metric: D) -> io::Result<Self> {
+        let (inner, payloads) = persist::load_mmap_with_fixed_payload(path, metric)?;
+        Ok(Self { inner, payloads })
+    }
+
+    /// Search and decode only payloads attached to returned neighbors.
+    pub fn search<'a>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        self.inner
+            .search(query, k, ef)
+            .into_iter()
+            .map(|result| {
+                Ok(MappedLabeledResult {
+                    id: result.id,
+                    distance: result.distance,
+                    payload: self.payloads.get(result.id)?,
+                    embedding: self.inner.get_vector(result.id),
+                })
+            })
+            .collect()
+    }
+
+    /// Decode one payload directly from the mapped column.
+    pub fn get_payload(&self, id: usize) -> io::Result<L> {
+        self.payloads.get(id)
+    }
+
+    pub fn get_embedding(&self, id: usize) -> &[f32] {
+        self.inner.get_vector(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 

@@ -174,6 +174,14 @@ idx.insert(vec![1.0, 0.0], vec![0.9f32, 0.1, 0.0]);  // 3-D secondary
 idx.save("my.hnsw")?;
 let loaded = LabeledIndex::<Euclidean, Vec<f32>>::load("my.hnsw", Euclidean)?;
 let mmap   = LabeledIndex::<Euclidean, Vec<f32>>::load_mmap("my.hnsw", Euclidean)?;
+
+// Fixed-width payloads can also remain mapped. Values are decoded individually
+// instead of materializing the full payload column as Vec<u32>.
+let mapped = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(
+    "classes.hnsw", Euclidean,
+)?;
+let class: u32 = mapped.get_payload(0)?;
+let hits = mapped.search(&[0.9, 0.1], 3, 50)?;
 ```
 
 ---

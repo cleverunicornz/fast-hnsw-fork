@@ -56,7 +56,7 @@ pub mod persist;
 
 pub use builder::Builder;
 pub use hnsw::{Config, Hnsw, IndexStats, PruneStrategy, SearchResult};
-pub use labeled::LabeledIndex;
+pub use labeled::{LabeledIndex, MappedLabeledIndex, MappedLabeledResult};
 pub use paired::PairedIndex;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -586,6 +586,78 @@ mod tests {
         for i in 0..30_usize {
             assert_eq!(mmap.get_payload(i), &(i as u32));
         }
+    }
+
+    #[test]
+    fn labeled_fixed_payloads_stay_mapped() {
+        let mut idx: LabeledIndex<Euclidean, u32> =
+            Builder::new().seed(421).build_labeled(Euclidean);
+        for i in 0..30_u32 {
+            idx.insert(vec![i as f32], i * 10);
+        }
+        let dir = tempdir();
+        let path = dir.join("labeled_fixed_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let mmap = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(&path, Euclidean)
+            .expect("fixed mmap load failed");
+        assert!(matches!(
+            &mmap.inner.graph,
+            crate::hnsw::GraphStore::Mapped(_)
+        ));
+        assert_eq!(mmap.len(), 30);
+        for i in 0..30_usize {
+            assert_eq!(mmap.get_payload(i).expect("payload decode failed"), i as u32 * 10);
+        }
+        assert_eq!(
+            mmap.get_payload(30).expect_err("out-of-range id should fail").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let hits = mmap.search(&[12.0], 1, 20).expect("search failed");
+        assert_eq!(hits[0].id, 12);
+        assert_eq!(hits[0].payload, 120);
+        assert_eq!(hits[0].embedding, &[12.0]);
+    }
+
+    #[test]
+    fn labeled_mapped_payloads_reject_variable_width_types() {
+        let mut idx: LabeledIndex<Euclidean, String> =
+            Builder::new().seed(422).build_labeled(Euclidean);
+        idx.insert(vec![1.0], "one".to_string());
+        let dir = tempdir();
+        let path = dir.join("labeled_variable_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let error = LabeledIndex::<Euclidean, String>::load_mmap_fixed(&path, Euclidean)
+            .err()
+            .expect("variable-width mapped payload should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn labeled_mapped_payloads_reject_truncated_columns() {
+        let mut idx: LabeledIndex<Euclidean, u64> =
+            Builder::new().seed(423).build_labeled(Euclidean);
+        idx.insert(vec![1.0], 10);
+        idx.insert(vec![2.0], 20);
+        let dir = tempdir();
+        let path = dir.join("labeled_truncated_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        let truncated_len = file.metadata().expect("metadata failed").len() - 1;
+        file.set_len(truncated_len).expect("truncate failed");
+        drop(file);
+
+        let error = LabeledIndex::<Euclidean, u64>::load_mmap_fixed(&path, Euclidean)
+            .err()
+            .expect("truncated mapped payload should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("payload column"));
     }
 
     // ── PairedIndex tests ─────────────────────────────────────────────────

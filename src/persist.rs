@@ -157,6 +157,10 @@ pub(crate) const VERSION:         u32       = 1;
 pub(crate) const COMPACT_VERSION: u32       = 2;
 const FULL_EDGE_STRIDE:           usize     = 8;
 const COMPACT_EDGE_STRIDE:        usize     = 4;
+// `random_level` clamps its random input to f64::MIN_POSITIVE and M is at
+// least two, so a writer created by this crate cannot produce a level this
+// high. Keeping an explicit ceiling makes corrupted snapshots cheap to reject.
+const MAX_MAPPED_LEVEL:            usize     = 2_048;
 /// Byte offset where the vector data begins (fixed, so callers can mmap it).
 pub(crate) const VECTORS_OFFSET:  usize     = 256;
 
@@ -179,6 +183,15 @@ fn read_u32(buf: &[u8], off: usize) -> u32 {
 }
 fn read_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn read_usize(buf: &[u8], off: usize, field: &str) -> io::Result<usize> {
+    usize::try_from(read_u64(buf, off)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} does not fit in memory"),
+        )
+    })
 }
 
 fn u32_le(v: u32) -> [u8; 4] { v.to_le_bytes() }
@@ -611,20 +624,35 @@ fn read_hnsw_mmap_inner<D: Distance>(
     let edge_stride = edge_stride_for_version(version)?;
 
     // Bounds check: vector section must fit inside the mapping.
-    let vec_bytes = n * dim * 4;
-    if vec_offset + vec_bytes > mmap.len() {
+    let vec_values = n.checked_mul(dim).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector value count overflow")
+    })?;
+    let vec_bytes = vec_values.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector section size overflow")
+    })?;
+    let vec_end = vec_offset.checked_add(vec_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector section position overflow")
+    })?;
+    if vec_end > mmap.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file too short: vector section extends past end of file",
         ));
     }
+    if vec_offset % std::mem::align_of::<f32>() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vector section is not aligned for f32 access",
+        ));
+    }
 
-    let vs = VecStore::from_mmap(Arc::clone(&mmap), vec_offset, n, dim);
+    let vs = VecStore::from_mmap(Arc::clone(&mmap), vec_offset, vec_values, dim);
 
     // Levels, offsets, and adjacency records remain in the mapping. Validate
     // their bounds once at open, then let search decode edge pairs lazily.
-    let levels_offset = vec_offset + vec_bytes;
+    let levels_offset = vec_end;
     let payload_pos = validate_mapped_graph(&mmap, levels_offset, n, edge_stride)?;
+    validate_mapped_entry_point(&mmap, levels_offset, n, ep)?;
     let graph =
         GraphStore::from_mmap(Arc::clone(&mmap), levels_offset, n, edge_stride);
 
@@ -666,13 +694,13 @@ fn read_header<R: Read + Seek>(
         ));
     }
 
-    let n        = read_u64(&hdr, OFF_N)  as usize;
-    let dim      = read_u64(&hdr, OFF_DIM) as usize;
-    let m        = read_u64(&hdr, OFF_M)  as usize;
-    let m0       = read_u64(&hdr, OFF_M0) as usize;
-    let ef       = read_u64(&hdr, OFF_EF) as usize;
-    let ep_id    = read_u64(&hdr, OFF_EP_ID) as usize;
-    let ep_level = read_u64(&hdr, OFF_EP_LEVEL) as usize;
+    let n        = read_usize(&hdr, OFF_N, "vector count")?;
+    let dim      = read_usize(&hdr, OFF_DIM, "vector dimension")?;
+    let m        = read_usize(&hdr, OFF_M, "M")?;
+    let m0       = read_usize(&hdr, OFF_M0, "M0")?;
+    let ef       = read_usize(&hdr, OFF_EF, "ef_construction")?;
+    let raw_ep_id = read_u64(&hdr, OFF_EP_ID);
+    let ep_level = read_usize(&hdr, OFF_EP_LEVEL, "entry-point level")?;
 
     let use_heuristic      = hdr[OFF_FLAGS] != 0;
     let extend_candidates  = hdr[OFF_FLAGS + 1] != 0;
@@ -686,11 +714,52 @@ fn read_header<R: Read + Seek>(
         )),
     };
 
-    let entry_point = if ep_id == usize::MAX {
+    let entry_point = if raw_ep_id == u64::MAX {
         None
     } else {
+        let ep_id = usize::try_from(raw_ep_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry-point id does not fit in memory",
+            )
+        })?;
         Some((ep_id, ep_level))
     };
+
+    if m < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "M must be at least 2",
+        ));
+    }
+    if ef < m {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ef_construction must be at least M",
+        ));
+    }
+    match (n, dim, entry_point) {
+        (0, 0, None) => {}
+        (0, _, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty index has inconsistent dimensions or entry point",
+            ));
+        }
+        (_, 0, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty index has zero dimensions",
+            ));
+        }
+        (_, _, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty index is missing its entry point",
+            ));
+        }
+        _ => {}
+    }
 
     let config = Config {
         m,
@@ -840,6 +909,12 @@ fn validate_mapped_graph(
         let level = u32::from_le_bytes(
             mmap[level_pos..level_pos + 4].try_into().unwrap(),
         ) as usize;
+        if level > MAX_MAPPED_LEVEL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("node {node} level {level} exceeds supported maximum {MAX_MAPPED_LEVEL}"),
+            ));
+        }
 
         let offset_pos = offsets_offset + node * 8;
         let recorded = u64::from_le_bytes(
@@ -893,6 +968,49 @@ fn validate_mapped_graph(
     }
 
     Ok(position as u64)
+}
+
+fn validate_mapped_entry_point(
+    mmap: &[u8],
+    levels_offset: usize,
+    n: usize,
+    entry_point: Option<(usize, usize)>,
+) -> io::Result<()> {
+    let Some((id, level)) = entry_point else {
+        if n == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-empty index is missing its entry point",
+        ));
+    };
+    if id >= n {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("entry-point id {id} is out of range for {n} nodes"),
+        ));
+    }
+    let level_pos = levels_offset
+        .checked_add(id.checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "entry-point level position overflow")
+        })?)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "entry-point level position overflow")
+        })?;
+    let stored_level = mmap
+        .get(level_pos..level_pos + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry-point level is missing"))?;
+    let stored_level = u32::from_le_bytes(stored_level.try_into().unwrap()) as usize;
+    if level != stored_level {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "entry-point level {level} does not match node {id} level {stored_level}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ─── Payload I/O ─────────────────────────────────────────────────────────────

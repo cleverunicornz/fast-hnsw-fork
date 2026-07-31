@@ -3,8 +3,8 @@
 //! Run with:
 //!   cargo bench --bench compare
 //!
-//! Results are printed to stdout **and** written as JSONL to
-//! `figures/compare.jsonl` so the plotting scripts can consume them.
+//! Results are printed to stdout. Pass
+//! `--jsonl-output figures/compare.jsonl` to retain plotting input explicitly.
 //!
 //! ## Libraries compared
 //!
@@ -46,9 +46,6 @@ use space::Neighbor;
 // ── utilities ────────────────────────────────────────────────────────────────
 use rand::{RngExt, SeedableRng};
 use rand::rngs::SmallRng;
-
-// Absolute path to figures/ baked in at compile time.
-const FIGURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/figures");
 
 // ─── Parameters ──────────────────────────────────────────────────────────────
 
@@ -375,7 +372,12 @@ fn main() {
         unsafe { std::env::set_var("RUST_LOG", "error") };
     }
 
-    let full = std::env::args().any(|a| a == "--full");
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let full = arguments.iter().any(|argument| argument == "--full");
+    let output = arguments
+        .iter()
+        .position(|argument| argument == "--jsonl-output")
+        .and_then(|position| arguments.get(position + 1));
     let workloads = if full { WORKLOADS_FULL } else { WORKLOADS_DEFAULT };
 
     println!();
@@ -391,11 +393,20 @@ fn main() {
     println!("  hnsw_v0  — v0.11.0 by Geordon Worley (const-generic M, external Searcher)");
     println!("Speedup rows: ▲ = ours faster, ▼ = ours slower.  pp = percentage-point recall delta.");
 
-    // Open output file up-front so every result is flushed to disk as it arrives.
-    let out_path = format!("{FIGURES_DIR}/compare.jsonl");
-    let mut out: Option<fs::File> = match fs::File::create(&out_path) {
-        Ok(f)  => { println!("→ streaming results to {out_path}"); Some(f) }
-        Err(e) => { eprintln!("warn: could not create {out_path}: {e}"); None }
+    // Open an explicitly requested output file up-front so every result is
+    // flushed to disk as it arrives.
+    let mut out: Option<fs::File> = match output {
+        Some(path) => match fs::File::create(path) {
+            Ok(file) => {
+                println!("→ streaming results to {path}");
+                Some(file)
+            }
+            Err(error) => {
+                eprintln!("warn: could not create {path}: {error}");
+                None
+            }
+        },
+        None => None,
     };
 
     for &(n, dim, label) in workloads {
@@ -444,7 +455,7 @@ fn main() {
     println!("  • All benchmarks are single-threaded (sequential insert and search loops).");
     println!("  • Low recall at large n / small ef is expected — ef must grow with index size.");
 
-    if out.is_some() {
-        println!("→ done writing {out_path}");
+    if let Some(path) = output {
+        println!("→ done writing {path}");
     }
 }

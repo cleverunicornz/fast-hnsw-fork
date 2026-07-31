@@ -1,8 +1,8 @@
 //! Simple timing benchmarks (run with `cargo bench --bench bench`).
 //!
-//! Results are printed to stdout **and** written as JSONL to
-//! `figures/bench.jsonl` so the plotting scripts can consume them without
-//! scraping terminal output.
+//! Results are printed to stdout. Pass `--jsonl-output figures/bench.jsonl` to retain
+//! JSONL for the plotting scripts without making ordinary test runs mutate
+//! tracked benchmark evidence.
 //!
 //! ## JSONL schema
 //!
@@ -20,9 +20,6 @@ use std::time::Instant;
 use fast_hnsw::{Builder, Hnsw};
 use fast_hnsw::distance::Euclidean;
 use rand::{RngExt, SeedableRng};
-
-// Absolute path to figures/ baked in at compile time.
-const FIGURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/figures");
 
 // ─── Data generation ──────────────────────────────────────────────────────────
 
@@ -176,7 +173,12 @@ const SEARCH_FULL: &[(usize, usize, usize, usize)] = &[
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let full = std::env::args().any(|a| a == "--full");
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let full = arguments.iter().any(|argument| argument == "--full");
+    let output = arguments
+        .iter()
+        .position(|argument| argument == "--jsonl-output")
+        .and_then(|position| arguments.get(position + 1));
 
     let insert_cfgs = if full { INSERT_FULL  } else { INSERT_DEFAULT  };
     let search_cfgs = if full { SEARCH_FULL  } else { SEARCH_DEFAULT  };
@@ -185,11 +187,20 @@ fn main() {
              if full { "full — up to 1M" } else { "default — up to 50k; pass --full for more" });
     println!();
 
-    // Open output file up-front so every result is flushed to disk as it arrives.
-    let out_path = format!("{FIGURES_DIR}/bench.jsonl");
-    let mut out: Option<fs::File> = match fs::File::create(&out_path) {
-        Ok(f)  => { println!("→ streaming results to {out_path}\n"); Some(f) }
-        Err(e) => { eprintln!("warn: could not create {out_path}: {e}"); None }
+    // Open an explicitly requested output file up-front so every result is
+    // flushed to disk as it arrives.
+    let mut out: Option<fs::File> = match output {
+        Some(path) => match fs::File::create(path) {
+            Ok(file) => {
+                println!("→ streaming results to {path}\n");
+                Some(file)
+            }
+            Err(error) => {
+                eprintln!("warn: could not create {path}: {error}");
+                None
+            }
+        },
+        None => None,
     };
 
     let mut write = |rec: Record| {
@@ -208,7 +219,7 @@ fn main() {
         write(bench_search(n, dim, k, ef));
     }
 
-    if out.is_some() {
-        println!("\n→ done writing {out_path}");
+    if let Some(path) = output {
+        println!("\n→ done writing {path}");
     }
 }

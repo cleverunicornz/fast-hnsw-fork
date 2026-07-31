@@ -148,10 +148,9 @@ impl VecStore {
     pub(crate) fn from_mmap(
         mmap: Arc<memmap2::Mmap>,
         vec_offset: usize,
-        n: usize,
+        len: usize,
         dim: usize,
     ) -> Self {
-        let len = n * dim;
         // SAFETY: vec_offset + len*4 is guaranteed to be within the mapped
         // region by the caller (checked in `load_mmap`).
         let ptr = unsafe { mmap.as_ptr().add(vec_offset) as *const f32 };
@@ -780,6 +779,8 @@ pub struct Hnsw<D: Distance> {
     pruned_buf:  Vec<(usize, f32)>,
     /// Sorted candidate buffer for `prune_connections_heuristic` — reused.
     prune_buf:   Vec<(usize, f32)>,
+    /// Selected bidirectional edges retained across insertion layers.
+    edge_buf:    Vec<Edge>,
 }
 
 impl<D: Distance> Hnsw<D> {
@@ -807,6 +808,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf:  Vec::with_capacity(m * 2 + 2),
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
+            edge_buf:    Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -840,6 +842,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf: Vec::with_capacity(m * 2 + 2),
             pruned_buf: Vec::with_capacity(m * 2 + 2),
             prune_buf:  Vec::with_capacity(m * 2 + 2),
+            edge_buf:   Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -863,6 +866,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf:  Vec::with_capacity(m * 2 + 2),
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
+            edge_buf:    Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -929,22 +933,20 @@ impl<D: Distance> Hnsw<D> {
 
             // Add bidirectional edges.
             //
-            // We copy select_buf into a small stack array first because
+            // We copy select_buf into a retained edge buffer because
             // `prune_connections_heuristic` (called below) overwrites select_buf
             // and pruned_buf when it runs its own heuristic selection.
-            //
-            // m_max ≤ 2·M ≤ 64 in practice; the array is zero-cost on the stack.
-            let n_sel = self.select_buf.len();
-            let mut edge_buf = [(0u32, 0.0f32); 64];
-            for i in 0..n_sel {
-                let (nb, dist) = self.select_buf[i];
-                edge_buf[i] = (nb as u32, dist);
-            }
+            let mut edge_buf = std::mem::take(&mut self.edge_buf);
+            edge_buf.clear();
+            edge_buf.extend(
+                self.select_buf
+                    .iter()
+                    .map(|&(neighbour, distance)| (neighbour as u32, distance)),
+            );
 
             // Pass 1: add all edges (keeps the connection lists coherent before
             // any pruning modifies them).
-            for i in 0..n_sel {
-                let (nb_u32, dist_q_nb) = edge_buf[i];
+            for &(nb_u32, dist_q_nb) in &edge_buf {
                 let nb = nb_u32 as usize;
                 self.graph.neighbours_mut(q, layer).push((nb_u32, dist_q_nb));
                 self.graph.neighbours_mut(nb, layer).push((q as u32, dist_q_nb));
@@ -956,8 +958,8 @@ impl<D: Distance> Hnsw<D> {
             // (set via `Builder::prune_strategy`).  Both branches use the `f32`
             // distance that is stored alongside every neighbour id — so neither
             // branch needs to recompute the M distances from scratch.
-            for i in 0..n_sel {
-                let nb = edge_buf[i].0 as usize;
+            for &(nb_u32, _) in &edge_buf {
+                let nb = nb_u32 as usize;
                 if self.graph.neighbour_count(nb, layer) > m_max {
                     match self.config.prune_strategy {
 
@@ -985,6 +987,7 @@ impl<D: Distance> Hnsw<D> {
                     }
                 }
             }
+            self.edge_buf = edge_buf;
 
             std::mem::swap(&mut self.ep_buf, &mut self.scratch.out);
         }
@@ -1153,6 +1156,7 @@ impl<D: Distance> Hnsw<D> {
     #[inline] pub fn is_empty(&self)         -> bool          { self.vec_store.len() == 0 }
     #[inline] pub fn get_vector(&self, id: usize) -> &[f32]  { self.vec_store.get(id) }
     #[inline] pub fn dim(&self)              -> Option<usize> { self.dim }
+    #[inline] pub fn config(&self)           -> &Config       { &self.config }
     pub fn max_level(&self) -> Option<usize> { self.entry_point.map(|(_, l)| l) }
 
     // ─── Level generation ─────────────────────────────────────────────────
@@ -1187,9 +1191,8 @@ impl<D: Distance> Hnsw<D> {
             if visited.visit(ep_d.id) { scratch.push_entry(ep_d); }
         }
 
-        loop {
-            let c = match scratch.pop_candidate() { Some(c) => c, None => break };
-            let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
+        while let Some(c) = scratch.pop_candidate() {
+            let Some(worst) = scratch.worst_result_dist() else { break };
             if c.dist > worst { break; }
 
             if let Some(nb_list) = graph.neighbours(c.id, layer) {
@@ -1228,9 +1231,8 @@ impl<D: Distance> Hnsw<D> {
             if visited.visit(ep.id) { scratch.push_entry(ep); }
         }
 
-        loop {
-            let c = match scratch.pop_candidate() { Some(c) => c, None => break };
-            let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
+        while let Some(c) = scratch.pop_candidate() {
+            let Some(worst) = scratch.worst_result_dist() else { break };
             if c.dist > worst { break; }
 
             if let Some(nb_list) = graph.neighbours(c.id, layer) {
@@ -1377,10 +1379,10 @@ impl<D: Distance> Hnsw<D> {
         // Iterate candidates in closest-first order.  Accept candidate `e` iff
         // `d(q, e) ≤ d(e, s)` for every already-accepted neighbour `s`.
         // Equivalently, reject if any `s` is closer to `e` than `q` is.
-        for i in 0..cands.len() {
+        for candidate in cands {
             if self.select_buf.len() >= m { break; }
-            let e_dist = cands[i].dist;
-            let e_id   = cands[i].id;
+            let e_dist = candidate.dist;
+            let e_id   = candidate.id;
 
             let mut accept = true;
             for j in 0..self.select_buf.len() {

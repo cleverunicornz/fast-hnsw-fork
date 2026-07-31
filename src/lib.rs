@@ -545,6 +545,45 @@ mod tests {
             orig.search_filtered(&query, 10, 200, |id| id % 7 == 0),
             compact.search_filtered(&query, 10, 200, |id| id % 7 == 0)
         );
+
+        let compact_labeled_path = dir.join("compact-labeled-v2.hnsw");
+        let mut labeled = Builder::new().seed(303).build_labeled(Euclidean);
+        for id in 0..orig.len() {
+            labeled.insert(orig.get_vector(id).to_vec(), id as u32);
+        }
+        labeled
+            .save_compact(&compact_labeled_path)
+            .expect("compact labeled save failed");
+        let mapped = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(
+            &compact_labeled_path,
+            Euclidean,
+        )
+        .expect("compact labeled mmap load failed");
+        let expected = mapped.search(&query, 10, 100).expect("mapped search failed");
+        let mut workspace = SearchWorkspace::default();
+        let actual = mapped
+            .search_with_workspace(&query, 10, 100, &mut workspace)
+            .expect("workspace search failed");
+        assert_eq!(
+            actual.iter().map(|result| result.id).collect::<Vec<_>>(),
+            expected.iter().map(|result| result.id).collect::<Vec<_>>()
+        );
+        let expected = mapped
+            .search_filtered(&query, 10, 200, |id, _| id % 7 == 0)
+            .expect("mapped filtered search failed");
+        let actual = mapped
+            .search_filtered_with_workspace(
+                &query,
+                10,
+                200,
+                |id, _| id % 7 == 0,
+                &mut workspace,
+            )
+            .expect("workspace filtered search failed");
+        assert_eq!(
+            actual.iter().map(|result| result.id).collect::<Vec<_>>(),
+            expected.iter().map(|result| result.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -648,6 +687,86 @@ mod tests {
             .expect("out-of-range neighbour should fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("invalid neighbour id"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_out_of_range_entry_point() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let (index, _) = make_hnsw(n, 8, 308);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-entry-point.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(52)).expect("seek failed");
+        file.write_all(&(n as u64).to_le_bytes())
+            .expect("entry-point write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("out-of-range entry point should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("entry-point id"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_vector_size_overflow() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (index, _) = make_hnsw(20, 8, 309);
+        let dir = tempdir();
+        let path = dir.join("compact-vector-overflow.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(20)).expect("seek failed");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("dimension write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("overflowing vector dimensions should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("vector"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_implausible_node_level() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 310);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-level.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let levels_start = 256 + n * dim * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(levels_start as u64))
+            .expect("seek failed");
+        file.write_all(&u32::MAX.to_le_bytes())
+            .expect("level write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("implausible node level should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("supported maximum"));
     }
 
     #[test]

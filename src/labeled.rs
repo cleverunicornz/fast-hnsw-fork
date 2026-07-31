@@ -58,7 +58,7 @@ use std::cell::RefCell;
 
 use crate::Builder;
 use crate::distance::Distance;
-use crate::hnsw::{Config, Hnsw};
+use crate::hnsw::{Config, Hnsw, SearchResult, SearchWorkspace};
 use crate::payload::Payload;
 use crate::persist::{self, MappedPayloads};
 
@@ -137,7 +137,7 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///
     /// Returns the zero-based id assigned to this vector (same as `self.len()
     /// - 1` after the call).  Both the vector and the payload are stored
-    /// internally and retrievable by id.
+    ///   internally and retrievable by id.
     ///
     /// # Panics
     /// Panics if `embedding.len()` differs from previously inserted vectors,
@@ -301,8 +301,26 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         k: usize,
         ef: usize,
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        self.inner
-            .search(query, k, ef)
+        self.decode_results(self.inner.search(query, k, ef))
+    }
+
+    /// Search while retaining traversal allocations in a caller-owned
+    /// workspace for reuse by subsequent queries.
+    pub fn search_with_workspace<'a>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        self.decode_results(self.inner.search_with_workspace(query, k, ef, workspace))
+    }
+
+    fn decode_results<'a>(
+        &'a self,
+        results: Vec<SearchResult>,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        results
             .into_iter()
             .map(|result| {
                 Ok(MappedLabeledResult {
@@ -327,31 +345,41 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
     where
         F: Fn(usize, &L) -> bool,
     {
+        let mut workspace = SearchWorkspace::default();
+        self.search_filtered_with_workspace(query, k, ef, accepts, &mut workspace)
+    }
+
+    /// Filter-before-top-k search with reusable caller-owned traversal storage.
+    pub fn search_filtered_with_workspace<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
         let decode_error = RefCell::new(None);
-        let results = self.inner.search_filtered(query, k, ef, |id| {
-            match self.payloads.get(id) {
+        let results = self.inner.search_filtered_with_workspace(
+            query,
+            k,
+            ef,
+            |id| match self.payloads.get(id) {
                 Ok(payload) => accepts(id, &payload),
                 Err(error) => {
                     *decode_error.borrow_mut() = Some(error);
                     false
                 }
-            }
-        });
+            },
+            workspace,
+        );
         if let Some(error) = decode_error.into_inner() {
             return Err(error);
         }
 
-        results
-            .into_iter()
-            .map(|result| {
-                Ok(MappedLabeledResult {
-                    id: result.id,
-                    distance: result.distance,
-                    payload: self.payloads.get(result.id)?,
-                    embedding: self.inner.get_vector(result.id),
-                })
-            })
-            .collect()
+        self.decode_results(results)
     }
 
     /// Decode one payload directly from the mapped column.

@@ -1,4 +1,4 @@
-//! # hnsw
+//! # fast-hnsw
 //!
 //! A pure-Rust implementation of **Hierarchical Navigable Small World** (HNSW)
 //! approximate nearest-neighbour search, following the algorithm from:
@@ -10,8 +10,8 @@
 //! ## Quick start
 //!
 //! ```rust
-//! use hnsw::{Builder, Hnsw, SearchResult};
-//! use hnsw::distance::Euclidean;
+//! use fast_hnsw::{Builder, Hnsw, SearchResult};
+//! use fast_hnsw::distance::Euclidean;
 //!
 //! // Build an index.
 //! let mut index: Hnsw<Euclidean> = Builder::new()

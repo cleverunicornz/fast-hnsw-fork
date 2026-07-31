@@ -34,12 +34,12 @@ cargo add fast-hnsw
 
 ```toml
 [dependencies]
-hnsw = { path = "." }
+fast-hnsw = { path = "." }
 ```
 
 ```rust
-use hnsw::{Builder, Hnsw, SearchResult};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, Hnsw, SearchResult};
+use fast_hnsw::distance::Euclidean;
 
 fn main() {
     let mut index: Hnsw<Euclidean> = Builder::new()
@@ -97,8 +97,8 @@ fn main() {
 Every index type can be saved to a single binary file and reloaded with or without memory-mapping.
 
 ```rust
-use hnsw::{Builder, persist};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, persist};
+use fast_hnsw::distance::Euclidean;
 
 let mut index = Builder::new().m(16).ef_construction(200).build(Euclidean);
 // … insert vectors …
@@ -139,8 +139,8 @@ little-endian `(u32, f32)` edge as it traverses the mapped graph.
 A `LabeledIndex<D, L>` stores one value of type `L` alongside every vector.  Results from `search()` carry both the distance and a reference to the payload.
 
 ```rust
-use hnsw::{Builder, labeled::LabeledIndex};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, labeled::LabeledIndex};
+use fast_hnsw::distance::Euclidean;
 
 // ── Classification label (u32) ────────────────────────────────────────────────
 let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
@@ -183,8 +183,8 @@ let mmap   = LabeledIndex::<Euclidean, Vec<f32>>::load_mmap("my.hnsw", Euclidean
 A `PairedIndex<A, B>` maintains **two HNSW graphs** over the same items — one per embedding space — allowing search from either side.
 
 ```rust
-use hnsw::{Builder, paired::PairedIndex};
-use hnsw::distance::{Cosine, Euclidean};
+use fast_hnsw::{Builder, paired::PairedIndex};
+use fast_hnsw::distance::{Cosine, Euclidean};
 
 // text_dim=4 (Cosine), image_dim=3 (Euclidean)
 let mut idx: PairedIndex<Cosine, Euclidean> = Builder::new()
@@ -234,7 +234,7 @@ let mmap   = PairedIndex::<Cosine, Euclidean>::load_mmap("my_index", Cosine, Euc
 Any type can be persisted alongside vectors by implementing two methods:
 
 ```rust
-use hnsw::payload::{Payload, DecodeError};
+use fast_hnsw::payload::{Payload, DecodeError};
 
 #[derive(Clone)]
 struct MyLabel { category: u16, score: f32 }
@@ -299,8 +299,8 @@ Run the full paper Algorithm 4 diversity check, exploiting stored distances to e
 - **Recall**: full Algorithm 4 quality; recovers the ≈ 1 pp gap vs `Simple` on high-dimensional data.
 
 ```rust
-use hnsw::{Builder, PruneStrategy};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, PruneStrategy};
+use fast_hnsw::distance::Euclidean;
 
 // Default — fastest, beats hnsw_rs on both speed and recall:
 let fast = Builder::new()

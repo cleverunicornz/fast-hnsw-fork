@@ -1,8 +1,8 @@
 //! Ergonomic builder for [`Hnsw`].
 //!
 //! ```
-//! use hnsw::{Builder, Hnsw};
-//! use hnsw::distance::Cosine;
+//! use fast_hnsw::{Builder, Hnsw};
+//! use fast_hnsw::distance::Cosine;
 //!
 //! let index: Hnsw<Cosine> = Builder::new()
 //!     .m(32)
@@ -108,8 +108,8 @@ impl Builder {
     /// # Example
     ///
     /// ```
-    /// use hnsw::{Builder, PruneStrategy};
-    /// use hnsw::distance::Euclidean;
+    /// use fast_hnsw::{Builder, PruneStrategy};
+    /// use fast_hnsw::distance::Euclidean;
     ///
     /// // Fastest inserts (default):
     /// let fast = Builder::new()

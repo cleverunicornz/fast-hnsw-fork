@@ -1019,6 +1019,44 @@ impl<D: Distance> Hnsw<D> {
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> Vec<SearchResult> {
+        self.search_with_distance_and_workspace(
+            k,
+            ef,
+            |id| self.metric.distance(query, self.vec_store.get(id)),
+            workspace,
+        )
+    }
+
+    /// Search using a query-prepared external distance function.
+    ///
+    /// The callback receives a zero-based node id and returns its distance to
+    /// the current query. This lets read-only callers traverse the stored graph
+    /// while scoring vectors held in another representation (for example a
+    /// compressed mmap) without coupling HNSW to that storage format.
+    pub fn search_with_distance<F>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+    {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_with_distance_and_workspace(k, ef, distance, &mut workspace)
+    }
+
+    /// External-distance search with caller-owned reusable workspace.
+    pub fn search_with_distance_and_workspace<F>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+    {
         assert!(k > 0, "k must be > 0");
         let ef = ef.max(k);
 
@@ -1034,20 +1072,30 @@ impl<D: Distance> Hnsw<D> {
             entry_points,
         } = workspace;
 
-        let ep_dist = self.metric.distance(query, self.vec_store.get(ep_id));
+        let ep_dist = distance(ep_id);
         entry_points.push(DistId::new(ep_dist, ep_id));
 
         for layer in (1..=ep_level).rev() {
-            Self::do_search_layer(
-                &self.vec_store, &self.graph, &self.metric,
-                visited, scratch, query, entry_points, 1, layer,
+            Self::do_search_layer_with_distance(
+                &self.graph,
+                visited,
+                scratch,
+                entry_points,
+                1,
+                layer,
+                &distance,
             );
             std::mem::swap(entry_points, &mut scratch.out);
         }
 
-        Self::do_search_layer(
-            &self.vec_store, &self.graph, &self.metric,
-            visited, scratch, query, entry_points, ef, 0,
+        Self::do_search_layer_with_distance(
+            &self.graph,
+            visited,
+            scratch,
+            entry_points,
+            ef,
+            0,
+            &distance,
         );
         scratch.out.truncate(k);
         scratch.out.iter()
@@ -1095,6 +1143,50 @@ impl<D: Distance> Hnsw<D> {
     where
         F: Fn(usize) -> bool,
     {
+        self.search_filtered_with_distance_and_workspace(
+            k,
+            ef,
+            |id| self.metric.distance(query, self.vec_store.get(id)),
+            accepts,
+            workspace,
+        )
+    }
+
+    /// Filtered graph traversal using an external distance-by-node function.
+    pub fn search_filtered_with_distance<F, A>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        accepts: A,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+    {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_filtered_with_distance_and_workspace(
+            k,
+            ef,
+            distance,
+            accepts,
+            &mut workspace,
+        )
+    }
+
+    /// Filtered external-distance search with caller-owned reusable workspace.
+    pub fn search_filtered_with_distance_and_workspace<F, A>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        accepts: A,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+    {
         assert!(k > 0, "k must be > 0");
         let ef = ef.max(k);
 
@@ -1110,36 +1202,32 @@ impl<D: Distance> Hnsw<D> {
             entry_points,
         } = workspace;
 
-        let entry_distance = self.metric.distance(query, self.vec_store.get(ep_id));
+        let entry_distance = distance(ep_id);
         entry_points.push(DistId::new(entry_distance, ep_id));
 
         // Upper layers are navigation-only and deliberately ignore the
         // eligibility predicate.
         for layer in (1..=ep_level).rev() {
-            Self::do_search_layer(
-                &self.vec_store,
+            Self::do_search_layer_with_distance(
                 &self.graph,
-                &self.metric,
                 visited,
                 scratch,
-                query,
                 entry_points,
                 1,
                 layer,
+                &distance,
             );
             std::mem::swap(entry_points, &mut scratch.out);
         }
 
-        Self::do_search_layer_filtered(
-            &self.vec_store,
+        Self::do_search_layer_filtered_with_distance(
             &self.graph,
-            &self.metric,
             visited,
             scratch,
-            query,
             entry_points,
             ef,
             &accepts,
+            &distance,
         );
         scratch.out.truncate(k);
         scratch
@@ -1213,17 +1301,17 @@ impl<D: Distance> Hnsw<D> {
 
     // ─── search_layer (search path — takes explicit params) ───────────────
 
-    fn do_search_layer(
-        vec_store:    &VecStore,
-        graph:        &GraphStore,
-        metric:       &D,
-        visited:      &mut VisitedTracker,
-        scratch:      &mut Scratch,
-        query:        &[f32],
+    fn do_search_layer_with_distance<F>(
+        graph: &GraphStore,
+        visited: &mut VisitedTracker,
+        scratch: &mut Scratch,
         entry_points: &[DistId],
-        ef:           usize,
-        layer:        usize,
-    ) {
+        ef: usize,
+        layer: usize,
+        distance: &F,
+    ) where
+        F: Fn(usize) -> f32,
+    {
         visited.begin();
         scratch.begin(ef);
 
@@ -1239,7 +1327,7 @@ impl<D: Distance> Hnsw<D> {
                 for (nb_u32, _) in nb_list {
                     let nb = nb_u32 as usize;
                     if visited.visit(nb) {
-                        let nb_dist = metric.distance(query, vec_store.get(nb));
+                        let nb_dist = distance(nb);
                         let cur_worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
                         if nb_dist < cur_worst || scratch.results_len() < ef {
                             scratch.push_candidate(DistId::new(nb_dist, nb));
@@ -1254,18 +1342,17 @@ impl<D: Distance> Hnsw<D> {
     // ─── search_layer (filtered layer-0 search) ───────────────────────────
 
     #[allow(clippy::too_many_arguments)]
-    fn do_search_layer_filtered<F>(
-        vec_store: &VecStore,
+    fn do_search_layer_filtered_with_distance<F, A>(
         graph: &GraphStore,
-        metric: &D,
         visited: &mut VisitedTracker,
         scratch: &mut Scratch,
-        query: &[f32],
         entry_points: &[DistId],
         ef: usize,
-        accepts: &F,
+        accepts: &A,
+        distance: &F,
     ) where
-        F: Fn(usize) -> bool,
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
     {
         visited.begin();
         scratch.begin(ef);
@@ -1292,7 +1379,7 @@ impl<D: Distance> Hnsw<D> {
                         continue;
                     }
 
-                    let distance = metric.distance(query, vec_store.get(neighbour));
+                    let distance = distance(neighbour);
                     let worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
                     if scratch.results_len() < ef || distance < worst {
                         let neighbour = DistId::new(distance, neighbour);

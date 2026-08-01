@@ -232,6 +232,51 @@ mod tests {
     }
 
     #[test]
+    fn external_distance_search_preserves_results_and_filtering() {
+        let index = build_index(200, 16, 48);
+        let vectors = (0..index.len())
+            .map(|id| index.get_vector(id).to_vec())
+            .collect::<Vec<_>>();
+        let query = [0.35; 16];
+        let distance = |id: usize| {
+            vectors[id]
+                .iter()
+                .zip(query)
+                .map(|(candidate, query)| {
+                    let difference = candidate - query;
+                    difference * difference
+                })
+                .sum::<f32>()
+                .sqrt()
+        };
+
+        assert_eq!(
+            index.search_with_distance(10, 75, distance),
+            index.search(&query, 10, 75)
+        );
+        assert_eq!(
+            index.search_filtered_with_distance(10, 75, distance, |id| id % 4 == 0),
+            index.search_filtered(&query, 10, 75, |id| id % 4 == 0)
+        );
+
+        let mut workspace = SearchWorkspace::default();
+        assert_eq!(
+            index.search_with_distance_and_workspace(10, 75, distance, &mut workspace),
+            index.search(&query, 10, 75)
+        );
+        assert_eq!(
+            index.search_filtered_with_distance_and_workspace(
+                10,
+                75,
+                distance,
+                |id| id % 4 == 0,
+                &mut workspace,
+            ),
+            index.search_filtered(&query, 10, 75, |id| id % 4 == 0)
+        );
+    }
+
+    #[test]
     fn stored_vectors_are_retrievable() {
         let mut index = Builder::new().seed(5).build(Euclidean);
         let vecs = vec![vec![1.0f32, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];

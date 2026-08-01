@@ -1,6 +1,6 @@
 # fast-hnsw
 
-A pure-Rust, dependency-free implementation of **Hierarchical Navigable Small World** (HNSW) approximate nearest-neighbour (ANN) search.
+A pure-Rust, dependency-light implementation of **Hierarchical Navigable Small World** (HNSW) approximate nearest-neighbour (ANN) search.
 
 > Malkov & Yashunin, *"Efficient and robust approximate nearest neighbor search using
 > Hierarchical Navigable Small World graphs"*, IEEE TPAMI 2018.
@@ -20,13 +20,14 @@ cargo add fast-hnsw
 - **Two pruning strategies** — `PruneStrategy::Simple` (default, fastest) and `PruneStrategy::Heuristic` (full Algorithm 4 for all edges, opt-in)
 - **Five built-in distance metrics** — Euclidean, Squared Euclidean, Cosine, Dot-product, Manhattan; add your own with a one-method trait
 - **Mmap-native persistence** — `load_mmap` traverses vectors and HNSW adjacency records directly from one read-only mapping; graph-sized heap reconstruction is not required
+- **Optional low-bit mmap sidecar** — the companion [`fast-hnsw-quantized`](quantized/) crate scores 2–4 bit rows during traversal while callers retain exact-vector reranking policy
 - **Labeled index** — `LabeledIndex<D, L>` attaches a typed `Payload` to every vector (class label, text tag, secondary embedding, custom struct)
 - **Paired index** — `PairedIndex<A, B>` builds two independent HNSW graphs over the same items (text+image, query+doc); search from either side, retrieve both embeddings per result
 - **Custom payload** — implement two methods (`encode` / `decode`) to persist any type; fixed-stride types use a flat layout, variable-width types get an offset table
 - **Capacity hint** — pre-allocate for expected index size to minimise reallocation churn
 - **Ergonomic builder** — `.build(metric)` / `.build_labeled(metric)` / `.build_paired(ma, mb)`
 - **Reproducible** — optional fixed RNG seed
-- **Tested** — 41 unit tests + 14 doc-tests including recall regression, persistence round-trips, mmap loads, and paired-search correctness
+- **Tested** — 61 core unit tests, 11 quantized-sidecar tests, and 15 doc-tests including recall regression, persistence round-trips, mmap loads, corruption checks, and filtered search
 
 ---
 
@@ -87,6 +88,9 @@ fn main() {
 | `search_with_workspace(&[f32], k, ef, &mut SearchWorkspace)` | Reuse visited and heap storage across repeated searches. |
 | `search_filtered(&[f32], k, ef, predicate)` | Apply id eligibility during traversal; rejected nodes remain navigable but never enter top-k. |
 | `search_filtered_with_workspace(...)` | Combine in-traversal filtering with caller-owned reusable storage. |
+| `search_with_distance(...)` | Traverse the graph using a prepared external distance-by-node callback. |
+| `search_with_distance_and_workspace(...)` | Combine external scoring with reusable query storage. |
+| `search_filtered_with_distance(...)` | Combine external scoring with filter-before-top-k semantics. |
 | `get_vector(id) -> &[f32]` | Retrieve a stored vector by id. |
 | `len() / is_empty() / dim() / max_level()` | Index introspection. |
 | `stats() -> IndexStats` | Layer-by-layer node and edge counts. |
@@ -122,6 +126,14 @@ for query in queries {
 Give each concurrent worker its own workspace. It grows automatically and
 retains its visited stamps, candidate heap, result heap, and upper-layer entry
 buffer. The returned top-k vector remains caller-owned.
+
+### Low-bit mmap traversal
+
+The optional [`fast-hnsw-quantized`](quantized/) companion stores 2-, 3-, or
+4-bit transformed rows in a checksummed mmap sidecar. Its `QuantizedHnsw`
+adapter uses the external-distance seam above, including in-traversal filters
+and reusable workspaces. The graph remains independent of the codec, and exact
+vectors can stay in a separate mmap for final reranking.
 
 ---
 

@@ -13,6 +13,10 @@ exclude = [
     "/figures/*"
 ]
 
+[workspace]
+members = ["quantized"]
+resolver = "2"
+
 [dependencies]
 rand     = "0.10"
 memmap2  = "0.9.11"   # pure-Rust mmap wrapper; zero C/C++ deps

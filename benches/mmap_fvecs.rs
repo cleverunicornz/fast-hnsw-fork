@@ -194,8 +194,8 @@ fn search(
     filter_modulo: Option<usize>,
 ) -> Vec<fast_hnsw::SearchResult> {
     match filter_modulo {
-        Some(modulo) => index.search_filtered(query, K, ef_search, |id| id % modulo == 0),
-        None => index.search(query, K, ef_search),
+        Some(modulo) => index.search_filtered(query, K, ef_search, |id| id % modulo == 0).unwrap(),
+        None => index.search(query, K, ef_search).unwrap(),
     }
 }
 
@@ -213,8 +213,8 @@ fn search_with_workspace(
             ef_search,
             |id| id % modulo == 0,
             workspace,
-        ),
-        None => index.search_with_workspace(query, K, ef_search, workspace),
+        ).unwrap(),
+        None => index.search_with_workspace(query, K, ef_search, workspace).unwrap(),
     }
 }
 

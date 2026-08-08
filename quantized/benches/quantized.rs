@@ -21,10 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ef_construction(200)
         .capacity(rows)
         .seed(42)
-        .build(Cosine);
+        .build(Cosine).unwrap();
     let build_started = Instant::now();
     for vector in &vectors {
-        index.insert(vector.clone());
+        index.insert(vector.clone()).unwrap();
     }
     let build_time = build_started.elapsed();
 
@@ -48,11 +48,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
 
     for row in &query_rows {
-        black_box(index.search(&vectors[*row], k, ef));
+        black_box(index.search(&vectors[*row], k, ef).unwrap());
         black_box(quantized.search(&vectors[*row], k, ef)?);
     }
     let (exact_time, exact_hits) = measure(&query_rows, |row| {
-        index.search(&vectors[row], k, ef)
+        index.search(&vectors[row], k, ef).unwrap()
     });
     let (quantized_time, quantized_hits) = measure(&query_rows, |row| {
         quantized

@@ -7,7 +7,7 @@
 //! let index: Hnsw<Cosine> = Builder::new()
 //!     .m(32)
 //!     .ef_construction(400)
-//!     .build(Cosine);
+//!     .build(Cosine).unwrap();
 //! ```
 
 use crate::distance::Distance;
@@ -114,12 +114,12 @@ impl Builder {
     /// // Fastest inserts (default):
     /// let fast = Builder::new()
     ///     .prune_strategy(PruneStrategy::Simple)
-    ///     .build(Euclidean);
+    ///     .build(Euclidean).unwrap();
     ///
     /// // Full Algorithm 4 quality:
     /// let quality = Builder::new()
     ///     .prune_strategy(PruneStrategy::Heuristic)
-    ///     .build(Euclidean);
+    ///     .build(Euclidean).unwrap();
     /// ```
     pub fn prune_strategy(mut self, strategy: PruneStrategy) -> Self {
         self.config.prune_strategy = strategy;
@@ -141,8 +141,14 @@ impl Builder {
         self
     }
 
+    /// The seed configured by [`Self::seed`], if any.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn seed_value(&self) -> Option<u64> {
+        self.seed
+    }
+
     /// Consume the builder and create an empty [`Hnsw`] index.
-    pub fn build<D: Distance>(self, metric: D) -> Hnsw<D> {
+    pub fn build<D: Distance>(self, metric: D) -> crate::Result<Hnsw<D>> {
         match self.seed {
             Some(s) => Hnsw::new_with_seed(self.config, metric, s),
             None    => Hnsw::new(self.config, metric),
@@ -153,7 +159,7 @@ impl Builder {
     ///
     /// Useful when you need to share the same config across multiple indexes.
     /// This intentionally discards the optional seed; call [`Self::build`],
-    /// [`build_labeled`], or [`build_paired`] when seeded construction matters.
+    /// `build_labeled`, or `build_paired` when seeded construction matters.
     pub fn into_config(self) -> Config {
         self.config
     }

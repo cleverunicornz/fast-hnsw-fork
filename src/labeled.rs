@@ -21,16 +21,17 @@
 //!
 //! let mut idx: LabeledIndex<Euclidean, u32> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
-//! );
+//! )?;
 //!
-//! idx.insert(vec![1.0, 0.0], 0_u32);   // class 0
-//! idx.insert(vec![0.0, 1.0], 1_u32);   // class 1
-//! idx.insert(vec![0.8, 0.2], 0_u32);   // class 0
+//! idx.insert(vec![1.0, 0.0], 0_u32).unwrap();   // class 0
+//! idx.insert(vec![0.0, 1.0], 1_u32).unwrap();   // class 1
+//! idx.insert(vec![0.8, 0.2], 0_u32).unwrap();   // class 0
 //!
-//! let results = idx.search(&[0.9, 0.1], 2, 20);
+//! let results = idx.search(&[0.9, 0.1], 2, 20).unwrap();
 //! for r in &results {
 //!     println!("id={} dist={:.3} class={}", r.id, r.distance, r.payload);
 //! }
+//! # Ok::<(), fast_hnsw::Error>(())
 //! ```
 //!
 //! # Example — text label + save/load
@@ -41,15 +42,16 @@
 //!
 //! let mut idx: LabeledIndex<Euclidean, String> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
-//! );
-//! idx.insert(vec![1.0, 0.0], "cat".to_string());
-//! idx.insert(vec![0.0, 1.0], "dog".to_string());
+//! )?;
+//! idx.insert(vec![1.0, 0.0], "cat".to_string()).unwrap();
+//! idx.insert(vec![0.0, 1.0], "dog".to_string()).unwrap();
 //!
 //! idx.save("animals.hnsw").unwrap();
 //!
 //! let loaded = LabeledIndex::<Euclidean, String>::load("animals.hnsw", Euclidean).unwrap();
-//! let hits = loaded.search(&[0.9, 0.1], 1, 10);
+//! let hits = loaded.search(&[0.9, 0.1], 1, 10).unwrap();
 //! println!("nearest: {}", hits[0].payload);  // "cat"
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use std::io;
@@ -58,6 +60,7 @@ use std::cell::RefCell;
 
 use crate::Builder;
 use crate::distance::Distance;
+use crate::error::Result;
 use crate::hnsw::{Config, Hnsw, SearchResult, SearchWorkspace};
 use crate::payload::Payload;
 use crate::persist::{self, MappedPayloads};
@@ -107,12 +110,10 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     /// Create a new, empty labeled index.
     ///
     /// For ergonomic construction with method chaining, use
-    /// [`Builder::build_labeled`](LabeledBuilder).
-    pub fn new(config: Config, metric: D) -> Self {
-        Self {
-            payloads: Vec::with_capacity(config.capacity),
-            inner:    Hnsw::new(config, metric),
-        }
+    /// [`Builder::build_labeled`].
+    pub fn new(config: Config, metric: D) -> Result<Self> {
+        let payloads = Vec::with_capacity(config.capacity);
+        Ok(Self { inner: Hnsw::new(config, metric)?, payloads })
     }
 
     /// Build from an existing [`Builder`].
@@ -125,12 +126,12 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///     .m(16)
     ///     .ef_construction(200)
     ///     .capacity(10_000)
-    ///     .build_labeled(Euclidean);
+    ///     .build_labeled(Euclidean).unwrap();
     /// ```
-    pub fn from_builder(builder: Builder, metric: D) -> Self {
-        let inner = builder.build(metric);
+    pub fn from_builder(builder: Builder, metric: D) -> Result<Self> {
+        let inner = builder.build(metric)?;
         let payloads = Vec::with_capacity(inner.config().capacity);
-        Self { inner, payloads }
+        Ok(Self { inner, payloads })
     }
 
     // ─── Mutation ─────────────────────────────────────────────────────────
@@ -144,11 +145,11 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     /// # Panics
     /// Panics if `embedding.len()` differs from previously inserted vectors,
     /// or if the index was loaded with `load_mmap` (read-only).
-    pub fn insert(&mut self, embedding: Vec<f32>, payload: L) -> usize {
-        let id = self.inner.insert(embedding);
+    pub fn insert(&mut self, embedding: Vec<f32>, payload: L) -> Result<usize> {
+        let id = self.inner.insert(embedding)?;
         debug_assert_eq!(id, self.payloads.len());
         self.payloads.push(payload);
-        id
+        Ok(id)
     }
 
     // ─── Query ────────────────────────────────────────────────────────────
@@ -166,16 +167,16 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         query: &[f32],
         k:     usize,
         ef:    usize,
-    ) -> Vec<LabeledResult<'a, L>> {
+    ) -> Result<Vec<LabeledResult<'a, L>>> {
         self.inner
-            .search(query, k, ef)
+            .search(query, k, ef)?
             .into_iter()
-            .map(|sr| LabeledResult {
+            .map(|sr| Ok(LabeledResult {
                 id:        sr.id,
                 distance:  sr.distance,
                 payload:   &self.payloads[sr.id],
-                embedding: self.inner.get_vector(sr.id),
-            })
+                embedding: self.inner.get_vector(sr.id)?,
+            }))
             .collect()
     }
 
@@ -186,20 +187,64 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         k: usize,
         ef: usize,
         accepts: F,
-    ) -> Vec<LabeledResult<'a, L>>
+    ) -> Result<Vec<LabeledResult<'a, L>>>
     where
         F: Fn(usize, &L) -> bool,
     {
         self.inner
-            .search_filtered(query, k, ef, |id| accepts(id, &self.payloads[id]))
+            .search_filtered(query, k, ef, |id| accepts(id, &self.payloads[id]))?
             .into_iter()
-            .map(|result| LabeledResult {
+            .map(|result| Ok(LabeledResult {
                 id: result.id,
                 distance: result.distance,
                 payload: &self.payloads[result.id],
-                embedding: self.inner.get_vector(result.id),
-            })
+                embedding: self.inner.get_vector(result.id)?,
+            }))
             .collect()
+    }
+
+    // ─── Deletion ─────────────────────────────────────────────────────────
+
+    /// Soft-delete `id`.  See [`Hnsw::remove`] for the semantics.
+    ///
+    /// The payload is retained so ids stay stable; it becomes unreachable
+    /// through search and is dropped by [`compacted`](Self::compacted).
+    pub fn remove(&mut self, id: usize) -> bool {
+        self.inner.remove(id)
+    }
+
+    /// Clear the tombstone on `id`.
+    pub fn restore(&mut self, id: usize) -> bool {
+        self.inner.restore(id)
+    }
+
+    /// Whether `id` has been tombstoned.
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.inner.is_deleted(id)
+    }
+
+    /// Number of tombstoned slots.
+    pub fn deleted_count(&self) -> usize {
+        self.inner.deleted_count()
+    }
+
+    /// Number of vectors still reachable by search.
+    pub fn live_len(&self) -> usize {
+        self.inner.live_len()
+    }
+
+    /// Rebuild without the deleted entries, carrying payloads across the
+    /// renumbering.
+    ///
+    /// Required before [`save`](Self::save) once anything has been removed:
+    /// the file format cannot record tombstones.
+    pub fn compacted(&self, metric: D, seed: Option<u64>) -> Result<Self> {
+        let (inner, old_ids) = self.inner.compacted(metric, seed)?;
+        let payloads = old_ids
+            .into_iter()
+            .map(|old_id| self.payloads[old_id].clone())
+            .collect();
+        Ok(Self { inner, payloads })
     }
 
     // ─── Direct access ────────────────────────────────────────────────────
@@ -208,13 +253,19 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///
     /// # Panics
     /// Panics if `id >= self.len()`.
-    pub fn get_payload(&self, id: usize) -> &L { &self.payloads[id] }
+    pub fn get_payload(&self, id: usize) -> Result<&L> {
+        self.payloads
+            .get(id)
+            .ok_or(crate::Error::IdOutOfBounds { id, len: self.payloads.len() })
+    }
+
+
 
     /// Retrieve the stored embedding for a specific id.
     ///
     /// # Panics
     /// Panics if `id >= self.len()`.
-    pub fn get_embedding(&self, id: usize) -> &[f32] { self.inner.get_vector(id) }
+    pub fn get_embedding(&self, id: usize) -> Result<&[f32]> { self.inner.get_vector(id) }
 
     /// Number of vectors in the index.
     pub fn len(&self) -> usize { self.inner.len() }
@@ -303,7 +354,7 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         k: usize,
         ef: usize,
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        self.decode_results(self.inner.search(query, k, ef))
+        self.decode_results(self.inner.search(query, k, ef)?)
     }
 
     /// Search while retaining traversal allocations in a caller-owned
@@ -315,7 +366,7 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         ef: usize,
         workspace: &mut SearchWorkspace,
     ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
-        self.decode_results(self.inner.search_with_workspace(query, k, ef, workspace))
+        self.decode_results(self.inner.search_with_workspace(query, k, ef, workspace)?)
     }
 
     fn decode_results<'a>(
@@ -329,7 +380,7 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
                     id: result.id,
                     distance: result.distance,
                     payload: self.payloads.get(result.id)?,
-                    embedding: self.inner.get_vector(result.id),
+                    embedding: self.inner.get_vector(result.id)?,
                 })
             })
             .collect()
@@ -347,8 +398,11 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
     where
         F: Fn(usize, &L) -> bool,
     {
-        let mut workspace = SearchWorkspace::default();
-        self.search_filtered_with_workspace(query, k, ef, accepts, &mut workspace)
+        // Reuse the calling thread's workspace rather than allocating a
+        // visited-stamp array proportional to the index size per query.
+        crate::hnsw::with_query_workspace(|workspace| {
+            self.search_filtered_with_workspace(query, k, ef, &accepts, workspace)
+        })
     }
 
     /// Filter-before-top-k search with reusable caller-owned traversal storage.
@@ -376,7 +430,7 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
                 }
             },
             workspace,
-        );
+        )?;
         if let Some(error) = decode_error.into_inner() {
             return Err(error);
         }
@@ -389,8 +443,8 @@ impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
         self.payloads.get(id)
     }
 
-    pub fn get_embedding(&self, id: usize) -> &[f32] {
-        self.inner.get_vector(id)
+    pub fn get_embedding(&self, id: usize) -> io::Result<&[f32]> {
+        Ok(self.inner.get_vector(id)?)
     }
 
     pub fn len(&self) -> usize {
@@ -414,10 +468,13 @@ impl Builder {
     /// let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
     ///     .m(16)
     ///     .ef_construction(200)
-    ///     .build_labeled(Euclidean);
-    /// idx.insert(vec![1.0, 2.0], 42_u32);
+    ///     .build_labeled(Euclidean).unwrap();
+    /// idx.insert(vec![1.0, 2.0], 42_u32).unwrap();
     /// ```
-    pub fn build_labeled<D: Distance, L: Payload>(self, metric: D) -> LabeledIndex<D, L> {
+    pub fn build_labeled<D: Distance, L: Payload>(
+        self,
+        metric: D,
+    ) -> Result<LabeledIndex<D, L>> {
         LabeledIndex::from_builder(self, metric)
     }
 }

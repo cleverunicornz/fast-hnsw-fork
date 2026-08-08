@@ -38,6 +38,16 @@ pub enum QuantizedError {
     IncompatibleQuery(String),
     IncompatibleIndex(String),
     InvalidSnapshot(String),
+    /// An error raised by the underlying HNSW index.
+    #[cfg(feature = "hnsw")]
+    Hnsw(fast_hnsw::Error),
+}
+
+#[cfg(feature = "hnsw")]
+impl From<fast_hnsw::Error> for QuantizedError {
+    fn from(error: fast_hnsw::Error) -> Self {
+        Self::Hnsw(error)
+    }
 }
 
 impl Display for QuantizedError {
@@ -59,6 +69,8 @@ impl Display for QuantizedError {
             }
             Self::IncompatibleIndex(message) => write!(formatter, "incompatible HNSW index: {message}"),
             Self::InvalidSnapshot(message) => write!(formatter, "invalid quantized snapshot: {message}"),
+            #[cfg(feature = "hnsw")]
+            Self::Hnsw(error) => Display::fmt(error, formatter),
         }
     }
 }
@@ -67,6 +79,8 @@ impl Error for QuantizedError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
+            #[cfg(feature = "hnsw")]
+            Self::Hnsw(error) => Some(error),
             _ => None,
         }
     }
@@ -666,7 +680,7 @@ mod hnsw_integration {
             self.vectors.validate_prepared(query)?;
             Ok(self.index.search_with_distance(k, ef, |id| {
                 self.vectors.distance_prepared_validated(query, id)
-            }))
+            })?)
         }
 
         pub fn search_prepared_with_workspace(
@@ -682,7 +696,7 @@ mod hnsw_integration {
                 ef,
                 |id| self.vectors.distance_prepared_validated(query, id),
                 workspace,
-            ))
+            )?)
         }
 
         pub fn search_filtered<A>(
@@ -698,7 +712,7 @@ mod hnsw_integration {
             let prepared = self.prepare_query(query)?;
             Ok(self.index.search_filtered_with_distance(k, ef, |id| {
                 self.vectors.distance_prepared_validated(&prepared, id)
-            }, accepts))
+            }, accepts)?)
         }
 
         pub fn search_filtered_prepared_with_workspace<A>(
@@ -719,7 +733,7 @@ mod hnsw_integration {
                 |id| self.vectors.distance_prepared_validated(query, id),
                 accepts,
                 workspace,
-            ))
+            )?)
         }
     }
 }
@@ -1289,9 +1303,9 @@ mod tests {
             .m(16)
             .ef_construction(100)
             .seed(42)
-            .build(Cosine);
+            .build(Cosine).unwrap();
         for vector in &vectors {
-            index.insert(vector.clone());
+            index.insert(vector.clone()).unwrap();
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         MappedQuantizedVectors::save(
@@ -1329,16 +1343,16 @@ mod tests {
         )
         .unwrap();
         let mapped = open_verified(file.path()).unwrap();
-        let mut wrong_rows = Builder::new().build(Cosine);
-        wrong_rows.insert(vec![1.0; 16]);
+        let mut wrong_rows = Builder::new().build(Cosine).unwrap();
+        wrong_rows.insert(vec![1.0; 16]).unwrap();
         assert!(matches!(
             QuantizedHnsw::new(&wrong_rows, &mapped),
             Err(QuantizedError::IncompatibleIndex(_))
         ));
 
-        let mut wrong_dimensions = Builder::new().build(Cosine);
+        let mut wrong_dimensions = Builder::new().build(Cosine).unwrap();
         for _ in 0..4 {
-            wrong_dimensions.insert(vec![1.0; 8]);
+            wrong_dimensions.insert(vec![1.0; 8]).unwrap();
         }
         assert!(matches!(
             QuantizedHnsw::new(&wrong_dimensions, &mapped),

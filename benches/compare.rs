@@ -215,8 +215,8 @@ fn bench_ours(
         .m(M)
         .ef_construction(EF_CONSTRUCTION)
         .seed(42)
-        .build(Euclidean);
-    for v in corpus { index.insert(v.clone()); }
+        .build(Euclidean).unwrap();
+    for v in corpus { index.insert(v.clone()).unwrap(); }
     let ins_dur = t.elapsed();
 
     let efs = EFS.iter().map(|&ef| {
@@ -224,7 +224,7 @@ fn bench_ours(
         let mut hits = 0usize;
         for (q, gt) in queries.iter().zip(ground_truth.iter()) {
             let gt_set: HashSet<usize> = gt.iter().copied().collect();
-            hits += index.search(q, K, ef).iter().filter(|r| gt_set.contains(&r.id)).count();
+            hits += index.search(q, K, ef).unwrap().iter().filter(|r| gt_set.contains(&r.id)).count();
         }
         let dur = t.elapsed();
         EfResult {

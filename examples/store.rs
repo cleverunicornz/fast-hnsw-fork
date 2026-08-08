@@ -59,9 +59,9 @@ fn main() {
 fn demo_bare_persist(tmp: &Path) {
     println!("\n=== 1. Bare Hnsw persist (owned load) ===");
 
-    let mut index = Builder::new().m(16).ef_construction(100).seed(1).build(Euclidean);
+    let mut index = Builder::new().m(16).ef_construction(100).seed(1).build(Euclidean).unwrap();
     for i in 0..100_u32 {
-        index.insert(vec![i as f32, (i * i) as f32]);
+        index.insert(vec![i as f32, (i * i) as f32]).unwrap();
     }
 
     let path = tmp.join("bare.hnsw");
@@ -72,8 +72,8 @@ fn demo_bare_persist(tmp: &Path) {
     assert_eq!(index.len(), loaded.len());
 
     let q = vec![49.5f32, 2450.0];
-    let r_orig   = index.search(&q, 3, 50);
-    let r_loaded = loaded.search(&q, 3, 50);
+    let r_orig   = index.search(&q, 3, 50).unwrap();
+    let r_loaded = loaded.search(&q, 3, 50).unwrap();
     assert_eq!(r_orig.iter().map(|r| r.id).collect::<Vec<_>>(),
                r_loaded.iter().map(|r| r.id).collect::<Vec<_>>());
     println!("  nearest ids: {:?}", r_orig.iter().map(|r| r.id).collect::<Vec<_>>());
@@ -87,7 +87,7 @@ fn demo_labeled_u32(tmp: &Path) {
 
     let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
         .m(16).ef_construction(100).seed(2)
-        .build_labeled(Euclidean);
+        .build_labeled(Euclidean).unwrap();
 
     // Three clusters: class 0 = [0,0], class 1 = [10,10], class 2 = [20,0]
     let data = [
@@ -99,7 +99,7 @@ fn demo_labeled_u32(tmp: &Path) {
         ([20.1, 0.2], 2),
     ];
     for (emb, label) in data {
-        idx.insert(emb.to_vec(), label);
+        idx.insert(emb.to_vec(), label).unwrap();
     }
 
     let path = tmp.join("class.hnsw");
@@ -107,7 +107,7 @@ fn demo_labeled_u32(tmp: &Path) {
 
     let loaded = LabeledIndex::<Euclidean, u32>::load(&path, Euclidean).expect("load failed");
     for q in [[0.0f32, 0.0], [10.0, 10.0], [20.0, 0.0]] {
-        let hits = loaded.search(&q, 1, 20);
+        let hits = loaded.search(&q, 1, 20).unwrap();
         println!("  query {:?} → class {} (dist={:.3})", q, hits[0].payload, hits[0].distance);
     }
 }
@@ -119,7 +119,7 @@ fn demo_labeled_string(tmp: &Path) {
 
     let mut idx: LabeledIndex<Cosine, String> = Builder::new()
         .m(16).ef_construction(100).seed(3)
-        .build_labeled(Cosine);
+        .build_labeled(Cosine).unwrap();
 
     let items = [
         ([1.0f32, 0.0, 0.0, 0.0], "technology"),
@@ -129,7 +129,7 @@ fn demo_labeled_string(tmp: &Path) {
         ([0.8,    0.2, 0.0, 0.0], "tech startup"),
     ];
     for (emb, tag) in items {
-        idx.insert(emb.to_vec(), tag.to_string());
+        idx.insert(emb.to_vec(), tag.to_string()).unwrap();
     }
 
     let path = tmp.join("tags.hnsw");
@@ -137,7 +137,7 @@ fn demo_labeled_string(tmp: &Path) {
     let loaded = LabeledIndex::<Cosine, String>::load(&path, Cosine).expect("load failed");
 
     let q = vec![0.9f32, 0.1, 0.0, 0.0];
-    let hits = loaded.search(&q, 2, 20);
+    let hits = loaded.search(&q, 2, 20).unwrap();
     print!("  query [tech-like] → ");
     for h in &hits { print!("{:?} (dist={:.3})  ", h.payload, h.distance); }
     println!();
@@ -150,18 +150,18 @@ fn demo_labeled_custom(tmp: &Path) {
 
     let mut idx: LabeledIndex<Euclidean, ClassLabel> = Builder::new()
         .m(16).ef_construction(100).seed(4)
-        .build_labeled(Euclidean);
+        .build_labeled(Euclidean).unwrap();
 
-    idx.insert(vec![1.0, 0.0], ClassLabel { class_id: 0, confidence: 0.95 });
-    idx.insert(vec![0.0, 1.0], ClassLabel { class_id: 1, confidence: 0.88 });
-    idx.insert(vec![0.5, 0.5], ClassLabel { class_id: 2, confidence: 0.72 });
+    idx.insert(vec![1.0, 0.0], ClassLabel { class_id: 0, confidence: 0.95 }).unwrap();
+    idx.insert(vec![0.0, 1.0], ClassLabel { class_id: 1, confidence: 0.88 }).unwrap();
+    idx.insert(vec![0.5, 0.5], ClassLabel { class_id: 2, confidence: 0.72 }).unwrap();
 
     let path = tmp.join("custom.hnsw");
     idx.save(&path).expect("save failed");
     let loaded = LabeledIndex::<Euclidean, ClassLabel>::load(&path, Euclidean)
         .expect("load failed");
 
-    let hits = loaded.search(&[0.9f32, 0.1], 1, 20);
+    let hits = loaded.search(&[0.9f32, 0.1], 1, 20).unwrap();
     let lbl = hits[0].payload;
     println!("  nearest: class={} confidence={:.2}", lbl.class_id, lbl.confidence);
     assert_eq!(lbl.class_id, 0);
@@ -174,9 +174,9 @@ fn demo_labeled_mmap(tmp: &Path) {
 
     let mut idx: LabeledIndex<Euclidean, String> = Builder::new()
         .m(16).ef_construction(100).seed(5)
-        .build_labeled(Euclidean);
+        .build_labeled(Euclidean).unwrap();
     for i in 0..200_u32 {
-        idx.insert(vec![i as f32, (i % 10) as f32], format!("item-{i}"));
+        idx.insert(vec![i as f32, (i % 10) as f32], format!("item-{i}")).unwrap();
     }
 
     let path = tmp.join("mmap.hnsw");
@@ -185,7 +185,7 @@ fn demo_labeled_mmap(tmp: &Path) {
     // Load with mmap: vector section stays page-cache backed, not copied.
     let mmap = LabeledIndex::<Euclidean, String>::load_mmap(&path, Euclidean)
         .expect("mmap load failed");
-    let hits = mmap.search(&[100.0f32, 0.0], 3, 50);
+    let hits = mmap.search(&[100.0f32, 0.0], 3, 50).unwrap();
     print!("  nearest labels: ");
     for h in &hits { print!("{} ", h.payload); }
     println!();
@@ -201,7 +201,7 @@ fn demo_paired_index(tmp: &Path) {
     // Side B: 3-D image embeddings (Euclidean distance)
     let mut idx: PairedIndex<Cosine, Euclidean> = Builder::new()
         .m(16).ef_construction(100).seed(6)
-        .build_paired(Cosine, Euclidean);
+        .build_paired(Cosine, Euclidean).unwrap();
 
     let pairs = [
         // (text_emb,                     image_emb,           description)
@@ -213,7 +213,7 @@ fn demo_paired_index(tmp: &Path) {
     ];
     let names = pairs.map(|(_, _, n)| n);
     for (ta, ib, _) in pairs {
-        idx.insert(ta.to_vec(), ib.to_vec());
+        idx.insert(ta.to_vec(), ib.to_vec()).unwrap();
     }
 
     let path = tmp.join("paired");
@@ -224,7 +224,7 @@ fn demo_paired_index(tmp: &Path) {
     // Use a text query → find nearest items → also get their image embeddings.
     let text_q = vec![0.8f32, 0.2, 0.0, 0.0]; // "something cat-like"
     println!("  Text query [cat-like]:");
-    for hit in loaded.search_by_a(&text_q, 3, 20) {
+    for hit in loaded.search_by_a(&text_q, 3, 20).unwrap() {
         println!("    id={} text_dist={:.3} name={:?} img_emb={:?}",
                  hit.id, hit.distance, names[hit.id], hit.emb_b);
     }
@@ -232,7 +232,7 @@ fn demo_paired_index(tmp: &Path) {
     // Use an image query → find nearest items → also get their text embeddings.
     let img_q = vec![0.05f32, 0.85, 0.1]; // "dog-like image"
     println!("  Image query [dog-like]:");
-    for hit in loaded.search_by_b(&img_q, 2, 20) {
+    for hit in loaded.search_by_b(&img_q, 2, 20).unwrap() {
         println!("    id={} img_dist={:.3} name={:?} text_emb={:?}",
                  hit.id, hit.distance, names[hit.id], hit.emb_a);
     }
@@ -245,9 +245,9 @@ fn demo_paired_mmap(tmp: &Path) {
 
     let mut idx: PairedIndex<Euclidean, Euclidean> = Builder::new()
         .m(16).ef_construction(50).seed(7)
-        .build_paired(Euclidean, Euclidean);
+        .build_paired(Euclidean, Euclidean).unwrap();
     for i in 0..100_u32 {
-        idx.insert(vec![i as f32], vec![i as f32, (i % 5) as f32]);
+        idx.insert(vec![i as f32], vec![i as f32, (i % 5) as f32]).unwrap();
     }
 
     let path = tmp.join("paired_mmap");
@@ -257,11 +257,11 @@ fn demo_paired_mmap(tmp: &Path) {
         .expect("mmap load failed");
     println!("  len={}, both sides mmap'd", m.len());
 
-    let hits = m.search_by_a(&[50.0f32], 1, 30);
+    let hits = m.search_by_a(&[50.0f32], 1, 30).unwrap();
     assert_eq!(hits[0].id, 50);
     println!("  search_by_a(50.0) → id={} emb_b={:?}", hits[0].id, hits[0].emb_b);
 
-    let hits = m.search_by_b(&[50.0f32, 0.0], 1, 30);
+    let hits = m.search_by_b(&[50.0f32, 0.0], 1, 30).unwrap();
     assert_eq!(hits[0].id, 50);
     println!("  search_by_b([50,0]) → id={} emb_a={:?}", hits[0].id, hits[0].emb_a);
 }

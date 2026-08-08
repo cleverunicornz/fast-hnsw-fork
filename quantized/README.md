@@ -21,9 +21,9 @@ use fast_hnsw_quantized::{
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.7]];
-let mut index = Builder::new().seed(42).build(Cosine);
+let mut index = Builder::new().seed(42).build(Cosine)?;
 for vector in &vectors {
-    index.insert(vector.clone());
+    index.insert(vector.clone())?;
 }
 
 let file = tempfile::NamedTempFile::new()?;

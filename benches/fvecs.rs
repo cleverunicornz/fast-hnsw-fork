@@ -49,15 +49,15 @@ fn main() -> io::Result<()> {
         .ef_construction(args.ef_construction)
         .capacity(rows)
         .seed(args.seed)
-        .build(DotProduct);
+        .build(DotProduct).unwrap();
     let started = Instant::now();
     for vector in &vectors {
-        index.insert(vector.clone());
+        index.insert(vector.clone()).unwrap();
     }
     let build = started.elapsed();
 
     for query in queries.iter().take(3) {
-        let _ = index.search(query, K, args.ef_search);
+        let _ = index.search(query, K, args.ef_search).unwrap();
     }
     let mut search_times = Vec::with_capacity(queries.len());
     let mut approximate = Vec::with_capacity(queries.len());
@@ -65,13 +65,13 @@ fn main() -> io::Result<()> {
     let mut approximate_filtered = Vec::with_capacity(queries.len());
     for query in &queries {
         let started = Instant::now();
-        let result = index.search(query, K, args.ef_search);
+        let result = index.search(query, K, args.ef_search).unwrap();
         search_times.push(started.elapsed());
         approximate.push(result.into_iter().map(|item| item.id).collect::<Vec<_>>());
 
         let started = Instant::now();
         let result =
-            index.search_filtered(query, K, args.ef_search, |id| id % GRAPH_COUNT == 0);
+            index.search_filtered(query, K, args.ef_search, |id| id % GRAPH_COUNT == 0).unwrap();
         filtered_search_times.push(started.elapsed());
         approximate_filtered.push(
             result
@@ -98,7 +98,7 @@ fn main() -> io::Result<()> {
     let reopened = persist::load_mmap(&snapshot, DotProduct)?;
     let mmap_open = started.elapsed();
     let started = Instant::now();
-    let reopened_result = reopened.search(&queries[0], K, args.ef_search);
+    let reopened_result = reopened.search(&queries[0], K, args.ef_search).unwrap();
     let first_query = started.elapsed();
     if reopened_result.is_empty() {
         return Err(io::Error::other("reopened index returned no results"));

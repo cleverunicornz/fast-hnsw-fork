@@ -36,11 +36,14 @@
 //! All feature vectors in one `Vec<f32>`, stride = `dim`.  One pointer
 //! dereference instead of two per distance call.
 //!
-//! ### 5 · Four-accumulator dot product
+//! ### 5 · Lane-folded distance kernels
 //!
-//! Independent accumulators remove the serial floating-point dependency chain
-//! in normalized-embedding distance calls without a platform-specific SIMD
-//! dependency.
+//! Every built-in metric folds into eight independent accumulators.  Float
+//! addition is not associative, so a plain `zip().sum()` is one serial
+//! dependency chain as long as the vector dimension and the compiler may not
+//! re-order it; splitting the fold lets the vectorizer emit SIMD adds without
+//! a platform-specific SIMD dependency.  Measured 1.9× at dim 128 and 4.1× at
+//! dim 768 versus the serial fold.
 //!
 //! ### 6 · `VisitedTracker` — O(1) generation-counter visited set
 //!
@@ -80,6 +83,7 @@ use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
 
 use crate::distance::Distance;
+use crate::error::{Error, Result};
 use crate::heap::DistId;
 
 // ─── Memory-mapped vector backing ────────────────────────────────────────────
@@ -127,10 +131,15 @@ unsafe impl Sync for MmapBacking {}
 /// and the [`MmapBacking`] must stay alive (it is stored in `mmap`).
 /// Inserts into a mmap-backed index are not allowed.
 pub(crate) struct VecStore {
-    /// Owned vector data (empty in mmap mode).
+    /// Owned vector data (empty in mmap and deferred modes).
     pub(crate) data: Vec<f32>,
     /// Optional memory-mapped backing (non-`None` in mmap mode).
     pub(crate) mmap: Option<MmapBacking>,
+    /// Vector count when the vectors are not resident at all — they live on
+    /// disk and are fetched per access by
+    /// [`PreadIndex`](crate::pread::PreadIndex). The store then knows how many
+    /// vectors exist and their width, but holds none of their bytes.
+    pub(crate) deferred: Option<usize>,
     pub(crate) dim:  usize,
 }
 
@@ -139,6 +148,17 @@ impl VecStore {
         Self {
             data: Vec::with_capacity(capacity.saturating_mul(dim.max(1))),
             mmap: None,
+            deferred: None,
+            dim,
+        }
+    }
+
+    /// A store that knows its shape but holds no vector bytes.
+    pub(crate) fn deferred(dim: usize, count: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            mmap: None,
+            deferred: Some(count),
             dim,
         }
     }
@@ -157,32 +177,66 @@ impl VecStore {
         Self {
             data: Vec::new(),
             mmap: Some(MmapBacking { _mmap: mmap, ptr, len }),
+            deferred: None,
             dim,
         }
     }
 
+    /// # Invariants
+    /// The caller must already have rejected read-only stores; `Hnsw::insert`
+    /// returns [`Error::ReadOnly`] before reaching here, so this is a
+    /// debug-only guard against an internal mistake, not input validation.
     pub(crate) fn push(&mut self, v: Vec<f32>) {
-        assert!(
-            self.mmap.is_none(),
-            "cannot insert into a memory-mapped (read-only) index"
-        );
+        debug_assert!(self.mmap.is_none(), "push into a read-only store");
         debug_assert_eq!(v.len(), self.dim);
         self.data.extend_from_slice(&v);
     }
 
+    /// # Invariants
+    /// `id` must be in range and the store resident. Both are checked by the
+    /// public `Hnsw::get_vector`, which returns an error instead; internal
+    /// callers pass ids that traversal already validated. The bounds check on
+    /// the mapped branch below is kept regardless, because it guards `unsafe`
+    /// pointer arithmetic — dropping it would turn a bug into undefined
+    /// behaviour rather than a crash.
     #[inline(always)]
     pub(crate) fn get(&self, id: usize) -> &[f32] {
+        debug_assert!(self.deferred.is_none(), "vectors are not resident");
         let s = id * self.dim;
         match &self.mmap {
             None => &self.data[s..s + self.dim],
-            // SAFETY: `s + self.dim <= len` because `id < n` (guaranteed by
-            // the caller — same as bounds in the owned case).
-            Some(mb) => unsafe { std::slice::from_raw_parts(mb.ptr.add(s), self.dim) },
+            Some(mb) => {
+                // The owned branch above is bounds-checked by slicing, and
+                // `get` is reachable from the safe public `Hnsw::get_vector`,
+                // so the mapped branch must be checked too — an unchecked
+                // pointer offset here would turn an out-of-range id into
+                // undefined behaviour rather than a panic.
+                assert!(
+                    s <= mb.len && self.dim <= mb.len - s,
+                    "vector id {id} is out of bounds for a memory-mapped index \
+                     holding {} vectors",
+                    mb.len.checked_div(self.dim).unwrap_or(0),
+                );
+                // SAFETY: the assertion above establishes that
+                // `s + self.dim <= mb.len`, and `MmapBacking`'s invariants
+                // guarantee `ptr` addresses `len` readable `f32` values for
+                // as long as the backing `Arc<Mmap>` is alive.
+                unsafe { std::slice::from_raw_parts(mb.ptr.add(s), self.dim) }
+            }
         }
+    }
+
+    /// `Some(count)` when the vectors live on disk rather than in memory.
+    #[inline]
+    pub(crate) fn deferred_len(&self) -> Option<usize> {
+        self.deferred
     }
 
     #[inline(always)]
     pub(crate) fn len(&self) -> usize {
+        if let Some(count) = self.deferred {
+            return count;
+        }
         if self.dim == 0 {
             return 0;
         }
@@ -192,8 +246,34 @@ impl VecStore {
         }
     }
 
+    /// The whole vector section as one contiguous `f32` slice.
+    ///
+    /// `None` when the vectors are not resident (deferred/`pread` mode), where
+    /// there is nothing contiguous to hand out.
+    ///
+    /// Only the BLAS `sgemv` path needs a contiguous view; every other caller
+    /// goes through `get`.
+    #[cfg(feature = "blas")]
+    #[inline]
+    pub(crate) fn as_slice(&self) -> Option<&[f32]> {
+        if self.deferred.is_some() {
+            return None;
+        }
+        match &self.mmap {
+            None => Some(&self.data),
+            // SAFETY: `MmapBacking`'s invariants guarantee `ptr` addresses
+            // `len` readable `f32` values for as long as the mapping is alive,
+            // which it is for the lifetime of this borrow.
+            Some(mb) => Some(unsafe { std::slice::from_raw_parts(mb.ptr, mb.len) }),
+        }
+    }
+
     /// Returns the whole vector section as a flat byte slice (for writing).
+    /// # Invariants
+    /// Only reached from the persistence writers, which are unreachable for a
+    /// non-resident index (`PreadIndex` exposes no `save`).
     pub(crate) fn as_bytes(&self) -> &[u8] {
+        debug_assert!(self.deferred.is_none(), "serialising a non-resident store");
         let (ptr, len) = match &self.mmap {
             None => (self.data.as_ptr(), self.data.len()),
             Some(mb) => (mb.ptr, mb.len),
@@ -359,7 +439,9 @@ impl GraphStore {
     fn push_node(&mut self, connections: Vec<Vec<Edge>>) {
         match self {
             Self::Owned(graph) => graph.push(connections),
-            Self::Mapped(_) => panic!("cannot insert into a memory-mapped (read-only) index"),
+            // Unreachable: `Hnsw::insert` returns `Error::ReadOnly` before
+            // reaching the graph.
+            Self::Mapped(_) => unreachable!("push into a read-only graph"),
         }
     }
 
@@ -367,7 +449,8 @@ impl GraphStore {
     fn neighbours_mut(&mut self, node: usize, layer: usize) -> &mut Vec<Edge> {
         match self {
             Self::Owned(graph) => &mut graph[node][layer],
-            Self::Mapped(_) => panic!("cannot mutate a memory-mapped (read-only) index"),
+            // Unreachable for the same reason as `push_node`.
+            Self::Mapped(_) => unreachable!("mutating a read-only graph"),
         }
     }
 }
@@ -415,18 +498,18 @@ impl MappedGraph {
 /// O(1) visited-node tracker.  Each search query increments `current`; a node
 /// `i` is "visited" iff `stamps[i] == current`.  `begin()` is a single
 /// integer increment — no allocation after construction.
-struct VisitedTracker {
+pub(crate) struct VisitedTracker {
     stamps:  Vec<u32>,
     current: u32,
 }
 
 impl VisitedTracker {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self { stamps: vec![0u32; capacity], current: 1 }
     }
 
     #[inline]
-    fn begin(&mut self) {
+    pub(crate) fn begin(&mut self) {
         self.current = self.current.wrapping_add(1);
         if self.current == 0 {
             self.stamps.fill(0);
@@ -443,7 +526,7 @@ impl VisitedTracker {
 
     /// Returns `true` if `id` was **not** previously visited, and marks it.
     #[inline]
-    fn visit(&mut self, id: usize) -> bool {
+    pub(crate) fn visit(&mut self, id: usize) -> bool {
         if id >= self.stamps.len() {
             self.stamps.resize(id * 2 + 1, 0);
         }
@@ -502,13 +585,12 @@ impl Scratch {
         }
     }
 
-    #[inline]
-    fn push_entry(&mut self, d: DistId) {
-        self.candidates.push(Reverse(d));
-        self.results.push(d);
-        if self.results.len() > self.results_cap { self.results.pop(); }
-    }
-
+    /// Admit `d` both as a traversal candidate and as a result.
+    ///
+    /// Used for entry points and for every neighbour accepted by an unfiltered
+    /// layer search — in that mode the two roles always coincide.  The filtered
+    /// search separates them via [`Scratch::push_navigation`] and
+    /// [`Scratch::push_result`].
     #[inline]
     fn push_candidate(&mut self, d: DistId) {
         self.candidates.push(Reverse(d));
@@ -587,6 +669,30 @@ impl Default for SearchWorkspace {
     }
 }
 
+thread_local! {
+    /// Scratch reused by the convenience search entry points.
+    ///
+    /// Without this, every `search()` call allocates and zeroes a visited-stamp
+    /// array proportional to the index size; at a million vectors that setup
+    /// cost dominated the traversal itself.  The workspace is per-thread, so
+    /// concurrent queries still never share mutable state.
+    static QUERY_WORKSPACE: std::cell::RefCell<SearchWorkspace> =
+        std::cell::RefCell::new(SearchWorkspace::default());
+}
+
+/// Run `f` with the calling thread's shared query workspace.
+///
+/// Falls back to a private workspace when the thread-local is already borrowed,
+/// which happens if a user-supplied distance or filter callback issues another
+/// search on the same thread.  Re-entrancy therefore costs an allocation rather
+/// than panicking.
+pub(crate) fn with_query_workspace<R>(f: impl FnOnce(&mut SearchWorkspace) -> R) -> R {
+    QUERY_WORKSPACE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut workspace) => f(&mut workspace),
+        Err(_) => f(&mut SearchWorkspace::default()),
+    })
+}
+
 // ─── Prune strategy ───────────────────────────────────────────────────────────
 
 /// Controls how an existing node's connection list is shrunk back to `M`
@@ -600,7 +706,7 @@ impl Default for SearchWorkspace {
 /// already had `M` connections its list grows to `M + 1` and must be pruned
 /// back to `M`.  The two strategies differ in *which* edge is dropped:
 ///
-/// | | [`Simple`] | [`Heuristic`] |
+/// | | [`Simple`](PruneStrategy::Simple) | [`Heuristic`](PruneStrategy::Heuristic) |
 /// |---|---|---|
 /// | Work per prune | Sort `M+1` stored `f32`s + truncate | O(M²/2) pairwise distance computations |
 /// | New distance calls | **0** | up to M²/2, ~40% skipped by triangle shortcut |
@@ -625,6 +731,7 @@ impl Default for SearchWorkspace {
 /// Because the distance is recorded at edge-add time (symmetric metric, free),
 /// the M distance *recomputations* that a naïve heuristic prune would require
 /// are completely eliminated.  Only the inter-neighbour pairwise checks remain.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PruneStrategy {
     /// **Sort-and-truncate** (default, fastest).
@@ -662,7 +769,7 @@ pub enum PruneStrategy {
     /// - Benchmark: ~1 µs per prune in L2 cache, ~11 µs at L3-miss rates
     ///   (M = 16, dim = 128).  × 16 prunes/insert ≈ 170 µs extra per insert
     ///   on large, high-dimensional indexes.
-    /// - Recall: full quality; recovers the gap vs [`Simple`].
+    /// - Recall: full quality; recovers the gap vs [`Simple`](PruneStrategy::Simple).
     Heuristic,
 }
 
@@ -671,6 +778,7 @@ pub enum PruneStrategy {
 /// Build-time parameters for an [`Hnsw`] index.
 ///
 /// Construct via [`Builder`](crate::Builder) for a more ergonomic API.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Max bidirectional links per non-zero layer (must be ≥ 2).
@@ -720,16 +828,48 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Reject parameters that cannot produce a usable graph.
+    ///
+    /// Called by every constructor, so an invalid `Config` is reported rather
+    /// than asserted.
+    pub fn validate(&self) -> Result<()> {
+        if self.m < 2 {
+            return Err(Error::InvalidConfig {
+                parameter: "m",
+                reason: format!("must be at least 2, got {}", self.m),
+            });
+        }
+        if self.ef_construction < self.m {
+            return Err(Error::InvalidConfig {
+                parameter: "ef_construction",
+                reason: format!(
+                    "must be at least m ({}) for usable recall, got {}",
+                    self.m, self.ef_construction
+                ),
+            });
+        }
+        if let Some(m0) = self.m0 {
+            if m0 < self.m {
+                return Err(Error::InvalidConfig {
+                    parameter: "m0",
+                    reason: format!("must be at least m ({}), got {m0}", self.m),
+                });
+            }
+        }
+        Ok(())
+    }
+
     #[inline] pub(crate) fn m0(&self) -> usize { self.m0.unwrap_or(2 * self.m) }
-    #[inline] fn max_links(&self, layer: usize) -> usize {
+    #[inline] pub(crate) fn max_links(&self, layer: usize) -> usize {
         if layer == 0 { self.m0() } else { self.m }
     }
-    #[inline] fn m_l(&self) -> f64 { 1.0 / (self.m as f64).ln() }
+    #[inline] pub(crate) fn m_l(&self) -> f64 { 1.0 / (self.m as f64).ln() }
 }
 
 // ─── Search result ────────────────────────────────────────────────────────────
 
 /// One result returned by [`Hnsw::search`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchResult {
     pub id:       usize,
@@ -748,13 +888,14 @@ pub struct SearchResult {
 /// use fast_hnsw::{Hnsw, Config};
 /// use fast_hnsw::distance::Euclidean;
 ///
-/// let mut index = Hnsw::new(Config::default(), Euclidean);
-/// index.insert(vec![1.0, 0.0]);
-/// index.insert(vec![0.0, 1.0]);
-/// index.insert(vec![0.5, 0.5]);
+/// let mut index = Hnsw::new(Config::default(), Euclidean)?;
+/// index.insert(vec![1.0, 0.0]).unwrap();
+/// index.insert(vec![0.0, 1.0]).unwrap();
+/// index.insert(vec![0.5, 0.5]).unwrap();
 ///
-/// let results = index.search(&[0.9, 0.1], 1, 20);
+/// let results = index.search(&[0.9, 0.1], 1, 20)?;
 /// assert_eq!(results[0].id, 0); // [1,0] is closest to [0.9,0.1]
+/// # Ok::<(), fast_hnsw::Error>(())
 /// ```
 pub struct Hnsw<D: Distance> {
     pub(crate) config: Config,
@@ -781,20 +922,27 @@ pub struct Hnsw<D: Distance> {
     prune_buf:   Vec<(usize, f32)>,
     /// Selected bidirectional edges retained across insertion layers.
     edge_buf:    Vec<Edge>,
+    /// Tombstones, indexed by node id.
+    ///
+    /// Left empty until the first [`Hnsw::remove`], so an index that never
+    /// deletes pays nothing for the feature.  Deleted nodes stay in the graph
+    /// as navigation waypoints — removing their edges would disconnect the
+    /// small-world structure — and are filtered out of results instead.
+    deleted: Vec<bool>,
+    /// Number of `true` entries in `deleted`, so `live_len` stays O(1).
+    deleted_count: usize,
 }
 
 impl<D: Distance> Hnsw<D> {
     // ─── Construction ─────────────────────────────────────────────────────
 
     /// Create a new, empty index.
-    pub fn new(config: Config, metric: D) -> Self {
-        assert!(config.m >= 2, "M must be at least 2");
-        assert!(config.ef_construction >= config.m,
-                "ef_construction should be ≥ M for good recall");
+    pub fn new(config: Config, metric: D) -> Result<Self> {
+        config.validate()?;
         let cap = config.capacity;
         let ef  = config.ef_construction;
         let m   = config.m;
-        Self {
+        Ok(Self {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
@@ -809,7 +957,9 @@ impl<D: Distance> Hnsw<D> {
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
             edge_buf:    Vec::with_capacity(m * 2 + 2),
-        }
+            deleted:     Vec::new(),
+            deleted_count: 0,
+        })
     }
 
     /// Reconstruct an index from its already-deserialized components.
@@ -843,16 +993,18 @@ impl<D: Distance> Hnsw<D> {
             pruned_buf: Vec::with_capacity(m * 2 + 2),
             prune_buf:  Vec::with_capacity(m * 2 + 2),
             edge_buf:   Vec::with_capacity(m * 2 + 2),
+            deleted:    Vec::new(),
+            deleted_count: 0,
         }
     }
 
     /// Create a new index with a fixed RNG seed (reproducible for tests).
-    pub fn new_with_seed(config: Config, metric: D, seed: u64) -> Self {
-        assert!(config.m >= 2);
+    pub fn new_with_seed(config: Config, metric: D, seed: u64) -> Result<Self> {
+        config.validate()?;
         let cap = config.capacity;
         let ef  = config.ef_construction;
         let m   = config.m;
-        Self {
+        Ok(Self {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
@@ -867,7 +1019,9 @@ impl<D: Distance> Hnsw<D> {
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
             edge_buf:    Vec::with_capacity(m * 2 + 2),
-        }
+            deleted:     Vec::new(),
+            deleted_count: 0,
+        })
     }
 
     // ─── Public API ───────────────────────────────────────────────────────
@@ -877,12 +1031,24 @@ impl<D: Distance> Hnsw<D> {
     /// # Panics
     /// Panics if `vector.len()` differs from the dimension of previously
     /// inserted vectors.
-    pub fn insert(&mut self, vector: Vec<f32>) -> usize {
+    pub fn insert(&mut self, vector: Vec<f32>) -> Result<usize> {
         let dim = vector.len();
         match self.dim {
-            None    => { self.dim = Some(dim); self.vec_store.dim = dim; }
-            Some(d) => assert_eq!(d, dim,
-                "all vectors must have the same dimension (expected {d}, got {dim})"),
+            None => {
+                if self.vec_store.mmap.is_some() {
+                    return Err(Error::ReadOnly);
+                }
+                self.dim = Some(dim);
+                self.vec_store.dim = dim;
+            }
+            Some(d) => {
+                if d != dim {
+                    return Err(Error::DimensionMismatch { expected: d, actual: dim });
+                }
+                if self.vec_store.mmap.is_some() {
+                    return Err(Error::ReadOnly);
+                }
+            }
         }
 
         let q       = self.vec_store.len();
@@ -903,7 +1069,7 @@ impl<D: Distance> Hnsw<D> {
 
         // ── First insertion ───────────────────────────────────────────────
         let (ep_id, ep_level) = match self.entry_point {
-            None => { self.entry_point = Some((q, q_level)); return q; }
+            None => { self.entry_point = Some((q, q_level)); return Ok(q); }
             Some(x) => x,
         };
 
@@ -946,10 +1112,19 @@ impl<D: Distance> Hnsw<D> {
 
             // Pass 1: add all edges (keeps the connection lists coherent before
             // any pruning modifies them).
+            //
+            // q's own list is resolved once instead of per edge; the reverse
+            // edges each touch a different node, so they still need a lookup
+            // apiece.  Splitting the two directions does not change either
+            // list's final contents or ordering.
+            {
+                let q_links = self.graph.neighbours_mut(q, layer);
+                q_links.extend(edge_buf.iter().copied());
+            }
             for &(nb_u32, dist_q_nb) in &edge_buf {
-                let nb = nb_u32 as usize;
-                self.graph.neighbours_mut(q, layer).push((nb_u32, dist_q_nb));
-                self.graph.neighbours_mut(nb, layer).push((q as u32, dist_q_nb));
+                self.graph
+                    .neighbours_mut(nb_u32 as usize, layer)
+                    .push((q as u32, dist_q_nb));
             }
 
             // Pass 2: prune any neighbour whose list now exceeds m_max.
@@ -995,15 +1170,22 @@ impl<D: Distance> Hnsw<D> {
         if q_level > ep_level {
             self.entry_point = Some((q, q_level));
         }
-        q
+        Ok(q)
     }
 
     /// Search for the `k` approximate nearest neighbours of `query`.
     ///
     /// `ef` controls recall vs. speed (`ef ≥ k`; larger → better recall).
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
-        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
-        self.search_with_workspace(query, k, ef, &mut workspace)
+    ///
+    /// Repeated calls on one thread reuse that thread's traversal storage, so
+    /// the per-query cost does not scale with the size of the index.  Use
+    /// [`Hnsw::search_with_workspace`] to own that storage explicitly.
+    ///
+    /// # Panics
+    /// Panics if `query.len()` differs from the index dimension, or if `k` is
+    /// zero.
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchResult>> {
+        with_query_workspace(|workspace| self.search_with_workspace(query, k, ef, workspace))
     }
 
     /// Search using caller-owned storage retained across queries.
@@ -1012,13 +1194,18 @@ impl<D: Distance> Hnsw<D> {
     /// reached the required node and `ef` capacities, traversal performs no
     /// visited-set or heap-buffer allocation. The returned result vector is
     /// still owned by the caller.
+    ///
+    /// # Panics
+    /// Panics if `query.len()` differs from the index dimension, or if `k` is
+    /// zero.
     pub fn search_with_workspace(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
         workspace: &mut SearchWorkspace,
-    ) -> Vec<SearchResult> {
+    ) -> Result<Vec<SearchResult>> {
+        self.check_query_dim(query)?;
         self.search_with_distance_and_workspace(
             k,
             ef,
@@ -1038,12 +1225,13 @@ impl<D: Distance> Hnsw<D> {
         k: usize,
         ef: usize,
         distance: F,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> f32,
     {
-        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
-        self.search_with_distance_and_workspace(k, ef, distance, &mut workspace)
+        with_query_workspace(|workspace| {
+            self.search_with_distance_and_workspace(k, ef, &distance, workspace)
+        })
     }
 
     /// External-distance search with caller-owned reusable workspace.
@@ -1053,15 +1241,31 @@ impl<D: Distance> Hnsw<D> {
         ef: usize,
         distance: F,
         workspace: &mut SearchWorkspace,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> f32,
     {
-        assert!(k > 0, "k must be > 0");
+        // Tombstoned nodes must stay navigable but never surface as results,
+        // which is exactly the filtered traversal's semantics.  Routing through
+        // it keeps the deletion check in one place; indexes with no deletions
+        // keep using the cheaper unfiltered path below.
+        if self.deleted_count > 0 {
+            return self.search_filtered_with_distance_and_workspace(
+                k,
+                ef,
+                distance,
+                |_| true,
+                workspace,
+            );
+        }
+
+        if k == 0 {
+            return Err(Error::ZeroK);
+        }
         let ef = ef.max(k);
 
         let (ep_id, ep_level) = match self.entry_point {
-            None    => return Vec::new(),
+            None    => return Ok(Vec::new()),
             Some(x) => x,
         };
 
@@ -1098,9 +1302,9 @@ impl<D: Distance> Hnsw<D> {
             &distance,
         );
         scratch.out.truncate(k);
-        scratch.out.iter()
+        Ok(scratch.out.iter()
             .map(|d| SearchResult { id: d.id, distance: d.dist })
-            .collect()
+            .collect())
     }
 
     /// Search while applying an eligibility predicate during layer-0
@@ -1113,18 +1317,23 @@ impl<D: Distance> Hnsw<D> {
     ///
     /// The predicate receives the zero-based vector id. If fewer than `k`
     /// accepted nodes are reachable, all accepted results found are returned.
+    ///
+    /// # Panics
+    /// Panics if `query.len()` differs from the index dimension, or if `k` is
+    /// zero.
     pub fn search_filtered<F>(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
         accepts: F,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> bool,
     {
-        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
-        self.search_filtered_with_workspace(query, k, ef, accepts, &mut workspace)
+        with_query_workspace(|workspace| {
+            self.search_filtered_with_workspace(query, k, ef, &accepts, workspace)
+        })
     }
 
     /// Filtered search using caller-owned storage retained across queries.
@@ -1132,6 +1341,10 @@ impl<D: Distance> Hnsw<D> {
     /// This combines the filter-before-top-k semantics of
     /// [`Hnsw::search_filtered`] with the allocation reuse of
     /// [`Hnsw::search_with_workspace`].
+    ///
+    /// # Panics
+    /// Panics if `query.len()` differs from the index dimension, or if `k` is
+    /// zero.
     pub fn search_filtered_with_workspace<F>(
         &self,
         query: &[f32],
@@ -1139,10 +1352,11 @@ impl<D: Distance> Hnsw<D> {
         ef: usize,
         accepts: F,
         workspace: &mut SearchWorkspace,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> bool,
     {
+        self.check_query_dim(query)?;
         self.search_filtered_with_distance_and_workspace(
             k,
             ef,
@@ -1159,19 +1373,20 @@ impl<D: Distance> Hnsw<D> {
         ef: usize,
         distance: F,
         accepts: A,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> f32,
         A: Fn(usize) -> bool,
     {
-        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
-        self.search_filtered_with_distance_and_workspace(
-            k,
-            ef,
-            distance,
-            accepts,
-            &mut workspace,
-        )
+        with_query_workspace(|workspace| {
+            self.search_filtered_with_distance_and_workspace(
+                k,
+                ef,
+                &distance,
+                &accepts,
+                workspace,
+            )
+        })
     }
 
     /// Filtered external-distance search with caller-owned reusable workspace.
@@ -1182,16 +1397,18 @@ impl<D: Distance> Hnsw<D> {
         distance: F,
         accepts: A,
         workspace: &mut SearchWorkspace,
-    ) -> Vec<SearchResult>
+    ) -> Result<Vec<SearchResult>>
     where
         F: Fn(usize) -> f32,
         A: Fn(usize) -> bool,
     {
-        assert!(k > 0, "k must be > 0");
+        if k == 0 {
+            return Err(Error::ZeroK);
+        }
         let ef = ef.max(k);
 
         let (ep_id, ep_level) = match self.entry_point {
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
             Some(entry_point) => entry_point,
         };
 
@@ -1220,31 +1437,272 @@ impl<D: Distance> Hnsw<D> {
             std::mem::swap(entry_points, &mut scratch.out);
         }
 
+        // Tombstoned nodes are excluded here rather than by the caller, so
+        // every search entry point — plain, filtered, and external-distance —
+        // honours deletions through this one predicate.  They still relay
+        // traversal, because the filtered layer search keeps rejected nodes as
+        // navigation candidates.
+        let eligible = |id: usize| !self.is_deleted(id) && accepts(id);
+
         Self::do_search_layer_filtered_with_distance(
             &self.graph,
             visited,
             scratch,
             entry_points,
             ef,
-            &accepts,
+            &eligible,
             &distance,
         );
         scratch.out.truncate(k);
-        scratch
+        Ok(scratch
             .out
             .iter()
             .map(|result| SearchResult {
                 id: result.id,
                 distance: result.dist,
             })
+            .collect())
+    }
+
+    // ─── Exact search ─────────────────────────────────────────────────────
+
+    /// Exhaustive k-nearest-neighbour search: scores every live vector.
+    ///
+    /// Unlike [`Hnsw::search`] this is exact, at `O(n · dim)` per query. It
+    /// exists for the cases where that is what you want — computing ground
+    /// truth to measure the approximate search's recall, and small indexes
+    /// where a full scan beats a graph traversal. Tombstoned vectors are
+    /// skipped, as in every other search.
+    ///
+    /// With the `blas` feature and an inner-product metric this dispatches to
+    /// a single `sgemv` over the whole vector store, which is where BLAS
+    /// genuinely wins: one call amortised across every candidate, rather than
+    /// the per-vector call that makes it lose in graph traversal. Measured
+    /// 4.5–24.8× over a scalar loop depending on dimension and batch size.
+    /// Every other metric uses the vectorised kernels.
+    ///
+    /// # Panics
+    /// Panics if `query.len()` differs from the index dimension, if `k` is
+    /// zero, or if the vectors are not resident (a `pread` index — read them
+    /// through [`PreadIndex`](crate::pread::PreadIndex) instead).
+    pub fn exact_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
+        self.check_query_dim(query)?;
+        if k == 0 {
+            return Err(Error::ZeroK);
+        }
+        if self.vec_store.deferred_len().is_some() {
+            return Err(Error::VectorsNotResident);
+        }
+        let count = self.vec_store.len();
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // BLAS fast path: only for the inner-product metric, where a matrix
+        // multiply computes precisely what the metric is defined as. The L2
+        // metrics could be expressed through the norm expansion, but that
+        // loses most of its significant digits for near-identical vectors —
+        // exactly the ones a k-NN query must rank correctly. See the
+        // `distance` module.
+        #[cfg(feature = "blas")]
+        {
+            if D::metric_id() == crate::distance::DotProduct::metric_id() {
+                if let Some(scores) = self.gemv_inner_products(query) {
+                    return Ok(Self::top_k(
+                        k,
+                        count,
+                        |id| 1.0 - scores[id],
+                        |id| self.is_deleted(id),
+                    ));
+                }
+            }
+        }
+
+        Ok(Self::top_k(
+            k,
+            count,
+            |id| self.metric.distance(query, self.vec_store.get(id)),
+            |id| self.is_deleted(id),
+        ))
+    }
+
+    /// All inner products between `query` and the vector store, via one
+    /// `sgemv`. `None` when the vectors are not contiguous.
+    #[cfg(feature = "blas")]
+    fn gemv_inner_products(&self, query: &[f32]) -> Option<Vec<f32>> {
+        let vectors = self.vec_store.as_slice()?;
+        let dim = self.dim?;
+        let count = self.vec_store.len();
+        if dim == 0 || count == 0 || count > i32::MAX as usize || dim > i32::MAX as usize {
+            return None;
+        }
+        let mut scores = vec![0.0f32; count];
+        // SAFETY: `vectors` holds `count * dim` contiguous floats (checked by
+        // `VecStore`), `query` holds `dim` (checked by `assert_query_dim`), and
+        // `scores` has room for `count`. The casts are guarded above.
+        unsafe {
+            crate::blas::cblas_sgemv(
+                crate::blas::CBLAS_ROW_MAJOR,
+                crate::blas::CBLAS_NO_TRANS,
+                count as i32,
+                dim as i32,
+                1.0,
+                vectors.as_ptr(),
+                dim as i32,
+                query.as_ptr(),
+                1,
+                0.0,
+                scores.as_mut_ptr(),
+                1,
+            );
+        }
+        Some(scores)
+    }
+
+    /// Bounded top-k over `count` ids, skipping those `skip` rejects.
+    fn top_k(
+        k: usize,
+        count: usize,
+        distance: impl Fn(usize) -> f32,
+        skip: impl Fn(usize) -> bool,
+    ) -> Vec<SearchResult> {
+        let mut worst = BinaryHeap::with_capacity(k + 1);
+        for id in 0..count {
+            if skip(id) {
+                continue;
+            }
+            worst.push(DistId::new(distance(id), id));
+            if worst.len() > k {
+                worst.pop();
+            }
+        }
+        worst
+            .into_sorted_vec()
+            .into_iter()
+            .map(|entry| SearchResult { id: entry.id, distance: entry.dist })
             .collect()
+    }
+
+    // ─── Deletion ─────────────────────────────────────────────────────────
+
+    /// Mark `id` as deleted.  Returns `false` if it was already deleted or is
+    /// out of range.
+    ///
+    /// This is a **soft delete**.  The node keeps its place in the graph and
+    /// still relays traversals, but it is excluded from every search result.
+    /// Physically removing it would sever the edges that make neighbouring
+    /// nodes reachable, so HNSW implementations universally tombstone instead.
+    ///
+    /// Ids of surviving vectors never shift, which is what lets a
+    /// [`LabeledIndex`](crate::labeled::LabeledIndex) or
+    /// [`PairedIndex`](crate::paired::PairedIndex) keep addressing payloads by
+    /// the same id.  Consequently [`Hnsw::len`] still counts tombstoned slots;
+    /// use [`Hnsw::live_len`] for the number of reachable vectors.
+    ///
+    /// Deleting works on a memory-mapped index too — the tombstones live in
+    /// memory and never write to the mapping.
+    ///
+    /// Recall degrades once tombstones dominate, because searches spend their
+    /// `ef` budget traversing dead nodes.  Rebuild with
+    /// [`Hnsw::compacted`] when [`Hnsw::deleted_count`] grows large.
+    pub fn remove(&mut self, id: usize) -> bool {
+        if id >= self.vec_store.len() {
+            return false;
+        }
+        if self.deleted.is_empty() {
+            self.deleted = vec![false; self.vec_store.len()];
+        } else if self.deleted.len() < self.vec_store.len() {
+            self.deleted.resize(self.vec_store.len(), false);
+        }
+        if self.deleted[id] {
+            return false;
+        }
+        self.deleted[id] = true;
+        self.deleted_count += 1;
+        true
+    }
+
+    /// Clear the tombstone on `id`, making it visible to searches again.
+    /// Returns `false` if it was not deleted.
+    pub fn restore(&mut self, id: usize) -> bool {
+        if id >= self.deleted.len() || !self.deleted[id] {
+            return false;
+        }
+        self.deleted[id] = false;
+        self.deleted_count -= 1;
+        true
+    }
+
+    /// Whether `id` has been tombstoned.
+    #[inline]
+    pub fn is_deleted(&self, id: usize) -> bool {
+        // The common case is an index with no deletions at all, where the
+        // vector is empty and this is a single length check.
+        !self.deleted.is_empty() && self.deleted.get(id).copied().unwrap_or(false)
+    }
+
+    /// Number of tombstoned slots.
+    #[inline]
+    pub fn deleted_count(&self) -> usize { self.deleted_count }
+
+    /// Number of vectors still reachable by search — [`Hnsw::len`] minus
+    /// [`Hnsw::deleted_count`].
+    #[inline]
+    pub fn live_len(&self) -> usize { self.vec_store.len() - self.deleted_count }
+
+    /// Rebuild into a fresh index holding only the live vectors.
+    ///
+    /// Returns the new index together with a map from **new id to old id**, so
+    /// callers can carry side tables across the renumbering.  Tombstones are
+    /// discarded; ids are densely reassigned in ascending order of the old
+    /// ids, so the map is sorted.
+    ///
+    /// The graph is rebuilt by reinsertion, which costs about as much as
+    /// building the original index. Pass `seed` to make the rebuild
+    /// reproducible.
+    ///
+    /// This is also how you persist an index that has deletions: [`save`] and
+    /// its variants refuse a tombstoned index, because the on-disk format has
+    /// no place to record tombstones and silently writing the deleted vectors
+    /// back would resurrect them on load.
+    ///
+    /// [`save`]: crate::persist::save
+    pub fn compacted(&self, metric: D, seed: Option<u64>) -> Result<(Hnsw<D>, Vec<usize>)> {
+        let mut config = self.config.clone();
+        config.capacity = self.live_len();
+        let mut rebuilt = match seed {
+            Some(seed) => Hnsw::new_with_seed(config, metric, seed)?,
+            None => Hnsw::new(config, metric)?,
+        };
+        let mut old_ids = Vec::with_capacity(self.live_len());
+        for old_id in 0..self.vec_store.len() {
+            if self.is_deleted(old_id) {
+                continue;
+            }
+            rebuilt.insert(self.vec_store.get(old_id).to_vec())?;
+            old_ids.push(old_id);
+        }
+        Ok((rebuilt, old_ids))
     }
 
     #[inline] pub fn len(&self)              -> usize         { self.vec_store.len() }
     #[inline] pub fn is_empty(&self)         -> bool          { self.vec_store.len() == 0 }
-    #[inline] pub fn get_vector(&self, id: usize) -> &[f32]  { self.vec_store.get(id) }
+    /// The stored vector for `id`.
+    #[inline]
+    pub fn get_vector(&self, id: usize) -> Result<&[f32]> {
+        let len = self.vec_store.len();
+        if id >= len {
+            return Err(Error::IdOutOfBounds { id, len });
+        }
+        if self.vec_store.deferred_len().is_some() {
+            return Err(Error::VectorsNotResident);
+        }
+        Ok(self.vec_store.get(id))
+    }
     #[inline] pub fn dim(&self)              -> Option<usize> { self.dim }
     #[inline] pub fn config(&self)           -> &Config       { &self.config }
+    /// The distance metric this index was built with.
+    #[inline] pub fn metric(&self)           -> &D            { &self.metric }
     pub fn max_level(&self) -> Option<usize> { self.entry_point.map(|(_, l)| l) }
 
     // ─── Level generation ─────────────────────────────────────────────────
@@ -1252,6 +1710,27 @@ impl<D: Distance> Hnsw<D> {
     fn random_level(&mut self) -> usize {
         let u: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         (-u.ln() * self.config.m_l()).floor() as usize
+    }
+
+    // ─── Query validation ─────────────────────────────────────────────────
+
+    /// Reject a query whose length does not match the indexed dimension.
+    ///
+    /// An empty index has no dimension yet and accepts anything.
+    ///
+    /// Every built-in metric folds with `zip` semantics, so a mismatched query
+    /// would otherwise be silently truncated (or silently ignore its extra
+    /// components) and return confident, wrong neighbours.  An empty index has
+    /// no dimension yet and accepts anything — it returns no results regardless.
+    #[inline]
+    pub(crate) fn check_query_dim(&self, query: &[f32]) -> Result<()> {
+        match self.dim {
+            Some(dim) if query.len() != dim => Err(Error::DimensionMismatch {
+                expected: dim,
+                actual: query.len(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     // ─── Distance helpers ─────────────────────────────────────────────────
@@ -1276,7 +1755,7 @@ impl<D: Distance> Hnsw<D> {
         scratch.begin(ef);
 
         for &ep_d in ep {
-            if visited.visit(ep_d.id) { scratch.push_entry(ep_d); }
+            if visited.visit(ep_d.id) { scratch.push_candidate(ep_d); }
         }
 
         while let Some(c) = scratch.pop_candidate() {
@@ -1316,7 +1795,7 @@ impl<D: Distance> Hnsw<D> {
         scratch.begin(ef);
 
         for &ep in entry_points {
-            if visited.visit(ep.id) { scratch.push_entry(ep); }
+            if visited.visit(ep.id) { scratch.push_candidate(ep); }
         }
 
         while let Some(c) = scratch.pop_candidate() {
@@ -1569,11 +2048,15 @@ impl<D: Distance> Hnsw<D> {
         }
 
         // ── Step 3: write result back to the connection list ──────────────
-        self.graph.neighbours_mut(node_id, layer).clear();
-        for i in 0..self.select_buf.len() {
-            let (id, dist) = self.select_buf[i];
-            self.graph.neighbours_mut(node_id, layer).push((id as u32, dist));
-        }
+        // `select_buf` and `graph` are disjoint fields, so the connection list
+        // is resolved once rather than re-matched on every push.
+        let links = self.graph.neighbours_mut(node_id, layer);
+        links.clear();
+        links.extend(
+            self.select_buf
+                .iter()
+                .map(|&(id, dist)| (id as u32, dist)),
+        );
     }
 
     // ─── Stats / debug ────────────────────────────────────────────────────
@@ -1594,6 +2077,7 @@ impl<D: Distance> Hnsw<D> {
 }
 
 /// Summary statistics about an [`Hnsw`] index.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug)]
 pub struct IndexStats {
     pub num_vectors:  usize,

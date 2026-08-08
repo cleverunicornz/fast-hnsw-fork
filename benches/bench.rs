@@ -70,11 +70,11 @@ fn bench_insert(n: usize, dim: usize) -> Record {
         .m(16)
         .ef_construction(200)
         .seed(42)
-        .build(Euclidean);
+        .build(Euclidean).unwrap();
 
     let t = Instant::now();
     for v in vecs {
-        index.insert(v);
+        index.insert(v).unwrap();
     }
     let elapsed = t.elapsed();
     let total_s       = elapsed.as_secs_f64();
@@ -97,15 +97,15 @@ fn bench_search(n: usize, dim: usize, k: usize, ef: usize) -> Record {
         .m(16)
         .ef_construction(200)
         .seed(42)
-        .build(Euclidean);
+        .build(Euclidean).unwrap();
     for v in vecs {
-        index.insert(v);
+        index.insert(v).unwrap();
     }
 
     let t = Instant::now();
     let mut sink = 0usize;
     for q in &queries {
-        sink += index.search(q, k, ef).len();
+        sink += index.search(q, k, ef).unwrap().len();
     }
     let elapsed      = t.elapsed();
     let nq           = queries.len();

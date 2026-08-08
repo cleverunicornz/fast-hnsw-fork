@@ -1,8 +1,8 @@
 //! Ergonomic builder for [`Hnsw`].
 //!
 //! ```
-//! use hnsw::{Builder, Hnsw};
-//! use hnsw::distance::Cosine;
+//! use fast_hnsw::{Builder, Hnsw};
+//! use fast_hnsw::distance::Cosine;
 //!
 //! let index: Hnsw<Cosine> = Builder::new()
 //!     .m(32)
@@ -108,8 +108,8 @@ impl Builder {
     /// # Example
     ///
     /// ```
-    /// use hnsw::{Builder, PruneStrategy};
-    /// use hnsw::distance::Euclidean;
+    /// use fast_hnsw::{Builder, PruneStrategy};
+    /// use fast_hnsw::distance::Euclidean;
     ///
     /// // Fastest inserts (default):
     /// let fast = Builder::new()
@@ -151,8 +151,9 @@ impl Builder {
 
     /// Consume the builder and return the resolved [`Config`].
     ///
-    /// Used internally by [`build_labeled`] and [`build_paired`]; also
-    /// useful when you need to share the same config across multiple indexes.
+    /// Useful when you need to share the same config across multiple indexes.
+    /// This intentionally discards the optional seed; call [`Self::build`],
+    /// [`build_labeled`], or [`build_paired`] when seeded construction matters.
     pub fn into_config(self) -> Config {
         self.config
     }

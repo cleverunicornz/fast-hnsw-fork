@@ -36,30 +36,37 @@
 //! All feature vectors in one `Vec<f32>`, stride = `dim`.  One pointer
 //! dereference instead of two per distance call.
 //!
-//! ### 5 · `VisitedTracker` — O(1) generation-counter visited set
+//! ### 5 · Four-accumulator dot product
+//!
+//! Independent accumulators remove the serial floating-point dependency chain
+//! in normalized-embedding distance calls without a platform-specific SIMD
+//! dependency.
+//!
+//! ### 6 · `VisitedTracker` — O(1) generation-counter visited set
 //!
 //! Replaces `HashSet::with_capacity(ef*4)` (1 703 ns/call) with a stamp array
 //! (105 ns/call) — 16× faster, zero allocation after construction.
 //!
-//! ### 6 · `Scratch` — reusable heap scratch space
+//! ### 7 · `Scratch` / `SearchWorkspace` — reusable query storage
 //!
 //! Both `BinaryHeap`s in `search_layer` are cleared (not reallocated) between
-//! calls.  `ep_buf` is swapped with `scratch.out` via `std::mem::swap` — zero
-//! copy between layers.
+//! calls. `SearchWorkspace` lets repeated `&self` queries retain their visited
+//! stamps, heaps, and entry buffer. `ep_buf` is swapped with `scratch.out` via
+//! `std::mem::swap` — zero copy between layers.
 //!
-//! ### 7 · `u32` + pre-allocated connection `Vec`s
+//! ### 8 · `u32` + pre-allocated connection `Vec`s
 //!
 //! `u32` IDs halve connection-list memory.  Each inner `Vec` is pre-created
 //! with `Vec::with_capacity(m_max)`.
 //!
-//! ### 8 · Triangle-inequality shortcut in heuristic selection
+//! ### 9 · Triangle-inequality shortcut in heuristic selection
 //!
 //! If `d(q,s) > 2·d(q,e)`, then `d(e,s) > d(q,e)` by the triangle
 //! inequality — the heuristic condition is trivially satisfied without
 //! computing the actual distance.  Measured 36% reduction in pairwise
 //! distance computations.
 //!
-//! ### 9 · `select_buf` / `pruned_buf` reuse
+//! ### 10 · `select_buf` / `pruned_buf` reuse
 //!
 //! Pre-allocated `Vec<(usize, f32)>` fields in `Hnsw` hold the results of
 //! `select_neighbours_*`; callers read from `self.select_buf` directly,
@@ -70,7 +77,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::distance::Distance;
 use crate::heap::DistId;
@@ -141,10 +148,9 @@ impl VecStore {
     pub(crate) fn from_mmap(
         mmap: Arc<memmap2::Mmap>,
         vec_offset: usize,
-        n: usize,
+        len: usize,
         dim: usize,
     ) -> Self {
-        let len = n * dim;
         // SAFETY: vec_offset + len*4 is guaranteed to be within the mapped
         // region by the caller (checked in `load_mmap`).
         let ptr = unsafe { mmap.as_ptr().add(vec_offset) as *const f32 };
@@ -187,16 +193,220 @@ impl VecStore {
     }
 
     /// Returns the whole vector section as a flat byte slice (for writing).
-    /// Only valid in owned mode.
     pub(crate) fn as_bytes(&self) -> &[u8] {
+        let (ptr, len) = match &self.mmap {
+            None => (self.data.as_ptr(), self.data.len()),
+            Some(mb) => (mb.ptr, mb.len),
+        };
         // SAFETY: f32 has no padding; any bit pattern is valid; alignment is
-        // satisfied because we're converting &[f32] → &[u8].
+        // satisfied because both owned and mapped vector sections are
+        // represented as aligned f32 storage.
         unsafe {
             std::slice::from_raw_parts(
-                self.data.as_ptr() as *const u8,
-                self.data.len() * std::mem::size_of::<f32>(),
+                ptr as *const u8,
+                len * std::mem::size_of::<f32>(),
             )
         }
+    }
+}
+
+// ─── Graph storage ───────────────────────────────────────────────────────────
+
+pub(crate) type Edge = (u32, f32);
+pub(crate) type OwnedGraph = Vec<Vec<Vec<Edge>>>;
+
+/// Storage boundary for HNSW adjacency lists.
+///
+/// Today the graph is owned and mutable. Search deliberately accesses it
+/// through [`GraphStore::neighbours`] so a read-only memory-mapped
+/// implementation can decode on-disk edges without changing the search
+/// algorithm or relying on the alignment/layout of `(u32, f32)`.
+pub(crate) enum GraphStore {
+    Owned(OwnedGraph),
+    Mapped(MappedGraph),
+}
+
+pub(crate) struct MappedGraph {
+    mmap: Arc<memmap2::Mmap>,
+    levels_offset: usize,
+    offsets_offset: usize,
+    node_count: usize,
+    edge_stride: usize,
+}
+
+pub(crate) enum Neighbours<'a> {
+    Owned(std::iter::Copied<std::slice::Iter<'a, Edge>>),
+    Mapped(MappedNeighbours<'a>),
+}
+
+pub(crate) struct MappedNeighbours<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    edge_stride: usize,
+}
+
+impl Iterator for Neighbours<'_> {
+    type Item = Edge;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Owned(inner) => inner.next(),
+            Self::Mapped(inner) => inner.next(),
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Owned(inner) => inner.size_hint(),
+            Self::Mapped(inner) => inner.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for Neighbours<'_> {}
+
+impl Iterator for MappedNeighbours<'_> {
+    type Item = Edge;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let edge = self
+            .bytes
+            .get(self.position..self.position + self.edge_stride)?;
+        self.position += self.edge_stride;
+        let id = u32::from_le_bytes(edge[..4].try_into().unwrap());
+        // Compact snapshots omit build-time edge distances. Search computes
+        // query-to-node distances from vectors and never consumes this value.
+        let distance = if self.edge_stride == 8 {
+            f32::from_le_bytes(edge[4..8].try_into().unwrap())
+        } else {
+            0.0
+        };
+        Some((id, distance))
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.bytes.len() - self.position) / self.edge_stride;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for MappedNeighbours<'_> {}
+
+impl GraphStore {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::Owned(Vec::with_capacity(capacity))
+    }
+
+    pub(crate) fn from_owned(owned: OwnedGraph) -> Self {
+        Self::Owned(owned)
+    }
+
+    pub(crate) fn from_mmap(
+        mmap: Arc<memmap2::Mmap>,
+        levels_offset: usize,
+        node_count: usize,
+        edge_stride: usize,
+    ) -> Self {
+        Self::Mapped(MappedGraph {
+            mmap,
+            levels_offset,
+            offsets_offset: levels_offset + node_count * 4,
+            node_count,
+            edge_stride,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn node_count(&self) -> usize {
+        match self {
+            Self::Owned(graph) => graph.len(),
+            Self::Mapped(graph) => graph.node_count,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn level_count(&self, node: usize) -> usize {
+        match self {
+            Self::Owned(graph) => graph[node].len(),
+            Self::Mapped(graph) => graph.level(node) + 1,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn neighbour_count(&self, node: usize, layer: usize) -> usize {
+        match self.neighbours(node, layer) {
+            Some(neighbours) => neighbours.len(),
+            None => 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn neighbours(&self, node: usize, layer: usize) -> Option<Neighbours<'_>> {
+        match self {
+            Self::Owned(graph) => graph
+                .get(node)
+                .and_then(|layers| layers.get(layer))
+                .map(|edges| Neighbours::Owned(edges.iter().copied())),
+            Self::Mapped(graph) => graph.neighbours(node, layer).map(Neighbours::Mapped),
+        }
+    }
+
+    #[inline]
+    fn push_node(&mut self, connections: Vec<Vec<Edge>>) {
+        match self {
+            Self::Owned(graph) => graph.push(connections),
+            Self::Mapped(_) => panic!("cannot insert into a memory-mapped (read-only) index"),
+        }
+    }
+
+    #[inline]
+    fn neighbours_mut(&mut self, node: usize, layer: usize) -> &mut Vec<Edge> {
+        match self {
+            Self::Owned(graph) => &mut graph[node][layer],
+            Self::Mapped(_) => panic!("cannot mutate a memory-mapped (read-only) index"),
+        }
+    }
+}
+
+impl MappedGraph {
+    #[inline(always)]
+    fn level(&self, node: usize) -> usize {
+        let start = self.levels_offset + node * 4;
+        u32::from_le_bytes(self.mmap[start..start + 4].try_into().unwrap()) as usize
+    }
+
+    #[inline(always)]
+    fn node_offset(&self, node: usize) -> usize {
+        let start = self.offsets_offset + node * 8;
+        u64::from_le_bytes(self.mmap[start..start + 8].try_into().unwrap()) as usize
+    }
+
+    #[inline]
+    fn neighbours(&self, node: usize, layer: usize) -> Option<MappedNeighbours<'_>> {
+        if node >= self.node_count || layer > self.level(node) {
+            return None;
+        }
+
+        let mut position = self.node_offset(node);
+        for _ in 0..layer {
+            let count =
+                u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
+            position += 4 + count * self.edge_stride;
+        }
+
+        let count =
+            u32::from_le_bytes(self.mmap[position..position + 4].try_into().unwrap()) as usize;
+        let start = position + 4;
+        let end = start + count * self.edge_stride;
+        Some(MappedNeighbours {
+            bytes: &self.mmap[start..end],
+            position: 0,
+            edge_stride: self.edge_stride,
+        })
     }
 }
 
@@ -224,6 +434,13 @@ impl VisitedTracker {
         }
     }
 
+    #[inline]
+    fn reserve_nodes(&mut self, capacity: usize) {
+        if self.stamps.len() < capacity {
+            self.stamps.resize(capacity, 0);
+        }
+    }
+
     /// Returns `true` if `id` was **not** previously visited, and marks it.
     #[inline]
     fn visit(&mut self, id: usize) -> bool {
@@ -243,8 +460,8 @@ impl VisitedTracker {
 
 /// Pre-allocated candidate min-heap + result max-heap + sorted output buffer.
 /// Stored inside `Hnsw` and *cleared* (not reallocated) between `search_layer`
-/// calls during `insert`.  For `search()` (`&self`) a local `Scratch` is
-/// created per query.
+/// calls during `insert`. Repeated immutable searches may retain one through
+/// [`SearchWorkspace`].
 struct Scratch {
     candidates:  BinaryHeap<Reverse<DistId>>,
     results:     BinaryHeap<DistId>,
@@ -270,6 +487,21 @@ impl Scratch {
         self.results_cap = ef;
     }
 
+    fn reserve_ef(&mut self, ef: usize) {
+        let candidate_capacity = ef.saturating_mul(2).saturating_add(1);
+        if self.candidates.capacity() < candidate_capacity {
+            self.candidates
+                .reserve(candidate_capacity.saturating_sub(self.candidates.len()));
+        }
+        if self.results.capacity() < ef.saturating_add(1) {
+            self.results
+                .reserve(ef.saturating_add(1).saturating_sub(self.results.len()));
+        }
+        if self.out.capacity() < ef {
+            self.out.reserve(ef.saturating_sub(self.out.len()));
+        }
+    }
+
     #[inline]
     fn push_entry(&mut self, d: DistId) {
         self.candidates.push(Reverse(d));
@@ -282,6 +514,19 @@ impl Scratch {
         self.candidates.push(Reverse(d));
         self.results.push(d);
         if self.results.len() > self.results_cap { self.results.pop(); }
+    }
+
+    #[inline]
+    fn push_navigation(&mut self, d: DistId) {
+        self.candidates.push(Reverse(d));
+    }
+
+    #[inline]
+    fn push_result(&mut self, d: DistId) {
+        self.results.push(d);
+        if self.results.len() > self.results_cap {
+            self.results.pop();
+        }
     }
 
     #[inline]
@@ -301,6 +546,44 @@ impl Scratch {
         self.out.clear();
         while let Some(d) = self.results.pop() { self.out.push(d); }
         self.out.reverse(); // max-heap → farthest-first; reverse → closest-first
+    }
+}
+
+/// Reusable, caller-owned storage for allocation-free repeated searches.
+///
+/// A workspace is mutable and therefore belongs to one query thread at a
+/// time. The index itself remains shared through `&Hnsw`; give each concurrent
+/// worker its own workspace. It grows automatically if either the index or
+/// `ef` exceeds the initial capacities, then retains those allocations.
+pub struct SearchWorkspace {
+    visited: VisitedTracker,
+    scratch: Scratch,
+    entry_points: Vec<DistId>,
+}
+
+impl SearchWorkspace {
+    /// Pre-allocate storage for an expected node count and search `ef`.
+    pub fn new(node_capacity: usize, ef_capacity: usize) -> Self {
+        Self {
+            visited: VisitedTracker::new(node_capacity),
+            scratch: Scratch::new(ef_capacity),
+            entry_points: Vec::with_capacity(ef_capacity),
+        }
+    }
+
+    fn prepare(&mut self, node_capacity: usize, ef_capacity: usize) {
+        self.visited.reserve_nodes(node_capacity);
+        self.scratch.reserve_ef(ef_capacity);
+        self.entry_points.clear();
+        if self.entry_points.capacity() < ef_capacity {
+            self.entry_points.reserve(ef_capacity);
+        }
+    }
+}
+
+impl Default for SearchWorkspace {
+    fn default() -> Self {
+        Self::new(0, 0)
     }
 }
 
@@ -462,8 +745,8 @@ pub struct SearchResult {
 ///
 /// # Example
 /// ```
-/// use hnsw::{Hnsw, Config};
-/// use hnsw::distance::Euclidean;
+/// use fast_hnsw::{Hnsw, Config};
+/// use fast_hnsw::distance::Euclidean;
 ///
 /// let mut index = Hnsw::new(Config::default(), Euclidean);
 /// index.insert(vec![1.0, 0.0]);
@@ -478,12 +761,12 @@ pub struct Hnsw<D: Distance> {
     pub(crate) metric: D,
     /// Flat vector store: vector `i` at `data[i*dim .. (i+1)*dim]`.
     pub(crate) vec_store: VecStore,
-    /// `connections[node][layer]` = list of (neighbour_id_u32, dist_from_node_to_neighbour).
+    /// HNSW adjacency storage, addressed by node and layer.
     ///
     /// Storing the distance alongside the id enables the heuristic reverse-update
     /// prune to skip all M distance recomputations — only the O(M²/2) pairwise
     /// diversity checks remain.
-    pub(crate) connections: Vec<Vec<Vec<(u32, f32)>>>,
+    pub(crate) graph: GraphStore,
     pub(crate) entry_point: Option<(usize, usize)>,
     rng:         SmallRng,
     pub(crate) dim: Option<usize>,
@@ -496,6 +779,8 @@ pub struct Hnsw<D: Distance> {
     pruned_buf:  Vec<(usize, f32)>,
     /// Sorted candidate buffer for `prune_connections_heuristic` — reused.
     prune_buf:   Vec<(usize, f32)>,
+    /// Selected bidirectional edges retained across insertion layers.
+    edge_buf:    Vec<Edge>,
 }
 
 impl<D: Distance> Hnsw<D> {
@@ -513,9 +798,9 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
-            connections: Vec::with_capacity(cap),
+            graph:        GraphStore::with_capacity(cap),
             entry_point: None,
-            rng:         SmallRng::from_entropy(),
+            rng:         rand::make_rng(),
             dim:         None,
             visited:     VisitedTracker::new(cap.max(64)),
             scratch:     Scratch::new(ef),
@@ -523,6 +808,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf:  Vec::with_capacity(m * 2 + 2),
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
+            edge_buf:    Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -535,7 +821,7 @@ impl<D: Distance> Hnsw<D> {
         config:      Config,
         metric:      D,
         vec_store:   VecStore,
-        connections: Vec<Vec<Vec<(u32, f32)>>>,
+        graph:       GraphStore,
         entry_point: Option<(usize, usize)>,
         dim:         Option<usize>,
     ) -> Self {
@@ -546,9 +832,9 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store,
-            connections,
+            graph,
             entry_point,
-            rng:        SmallRng::from_entropy(),
+            rng:        rand::make_rng(),
             dim,
             visited:    VisitedTracker::new(n.max(64)),
             scratch:    Scratch::new(ef),
@@ -556,6 +842,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf: Vec::with_capacity(m * 2 + 2),
             pruned_buf: Vec::with_capacity(m * 2 + 2),
             prune_buf:  Vec::with_capacity(m * 2 + 2),
+            edge_buf:   Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -569,7 +856,7 @@ impl<D: Distance> Hnsw<D> {
             config,
             metric,
             vec_store:   VecStore::new(0, cap),
-            connections: Vec::with_capacity(cap),
+            graph:        GraphStore::with_capacity(cap),
             entry_point: None,
             rng:         SmallRng::seed_from_u64(seed),
             dim:         None,
@@ -579,6 +866,7 @@ impl<D: Distance> Hnsw<D> {
             select_buf:  Vec::with_capacity(m * 2 + 2),
             pruned_buf:  Vec::with_capacity(m * 2 + 2),
             prune_buf:   Vec::with_capacity(m * 2 + 2),
+            edge_buf:    Vec::with_capacity(m * 2 + 2),
         }
     }
 
@@ -607,7 +895,7 @@ impl<D: Distance> Hnsw<D> {
         for l in 0..=q_level {
             conn.push(Vec::with_capacity(self.config.max_links(l)));
         }
-        self.connections.push(conn);
+        self.graph.push_node(conn);
 
         if self.visited.stamps.len() <= q {
             self.visited.stamps.resize(q * 2 + 1, 0);
@@ -645,25 +933,23 @@ impl<D: Distance> Hnsw<D> {
 
             // Add bidirectional edges.
             //
-            // We copy select_buf into a small stack array first because
+            // We copy select_buf into a retained edge buffer because
             // `prune_connections_heuristic` (called below) overwrites select_buf
             // and pruned_buf when it runs its own heuristic selection.
-            //
-            // m_max ≤ 2·M ≤ 64 in practice; the array is zero-cost on the stack.
-            let n_sel = self.select_buf.len();
-            let mut edge_buf = [(0u32, 0.0f32); 64];
-            for i in 0..n_sel {
-                let (nb, dist) = self.select_buf[i];
-                edge_buf[i] = (nb as u32, dist);
-            }
+            let mut edge_buf = std::mem::take(&mut self.edge_buf);
+            edge_buf.clear();
+            edge_buf.extend(
+                self.select_buf
+                    .iter()
+                    .map(|&(neighbour, distance)| (neighbour as u32, distance)),
+            );
 
             // Pass 1: add all edges (keeps the connection lists coherent before
             // any pruning modifies them).
-            for i in 0..n_sel {
-                let (nb_u32, dist_q_nb) = edge_buf[i];
+            for &(nb_u32, dist_q_nb) in &edge_buf {
                 let nb = nb_u32 as usize;
-                self.connections[q][layer].push((nb_u32, dist_q_nb));
-                self.connections[nb][layer].push((q as u32, dist_q_nb));
+                self.graph.neighbours_mut(q, layer).push((nb_u32, dist_q_nb));
+                self.graph.neighbours_mut(nb, layer).push((q as u32, dist_q_nb));
             }
 
             // Pass 2: prune any neighbour whose list now exceeds m_max.
@@ -672,9 +958,9 @@ impl<D: Distance> Hnsw<D> {
             // (set via `Builder::prune_strategy`).  Both branches use the `f32`
             // distance that is stored alongside every neighbour id — so neither
             // branch needs to recompute the M distances from scratch.
-            for i in 0..n_sel {
-                let nb = edge_buf[i].0 as usize;
-                if self.connections[nb][layer].len() > m_max {
+            for &(nb_u32, _) in &edge_buf {
+                let nb = nb_u32 as usize;
+                if self.graph.neighbour_count(nb, layer) > m_max {
                     match self.config.prune_strategy {
 
                         // ── Simple: sort stored distances + truncate ──────────
@@ -683,9 +969,9 @@ impl<D: Distance> Hnsw<D> {
                         //       connection list — no vector data touched, no new
                         //       distance computation.  ~25 ns per call.
                         PruneStrategy::Simple => {
-                            self.connections[nb][layer]
+                            self.graph.neighbours_mut(nb, layer)
                                 .sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-                            self.connections[nb][layer].truncate(m_max);
+                            self.graph.neighbours_mut(nb, layer).truncate(m_max);
                         }
 
                         // ── Heuristic: full Algorithm 4 with stored distances ─
@@ -701,6 +987,7 @@ impl<D: Distance> Hnsw<D> {
                     }
                 }
             }
+            self.edge_buf = edge_buf;
 
             std::mem::swap(&mut self.ep_buf, &mut self.scratch.out);
         }
@@ -715,6 +1002,61 @@ impl<D: Distance> Hnsw<D> {
     ///
     /// `ef` controls recall vs. speed (`ef ≥ k`; larger → better recall).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_with_workspace(query, k, ef, &mut workspace)
+    }
+
+    /// Search using caller-owned storage retained across queries.
+    ///
+    /// Results are identical to [`Hnsw::search`], but after the workspace has
+    /// reached the required node and `ef` capacities, traversal performs no
+    /// visited-set or heap-buffer allocation. The returned result vector is
+    /// still owned by the caller.
+    pub fn search_with_workspace(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult> {
+        self.search_with_distance_and_workspace(
+            k,
+            ef,
+            |id| self.metric.distance(query, self.vec_store.get(id)),
+            workspace,
+        )
+    }
+
+    /// Search using a query-prepared external distance function.
+    ///
+    /// The callback receives a zero-based node id and returns its distance to
+    /// the current query. This lets read-only callers traverse the stored graph
+    /// while scoring vectors held in another representation (for example a
+    /// compressed mmap) without coupling HNSW to that storage format.
+    pub fn search_with_distance<F>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+    {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_with_distance_and_workspace(k, ef, distance, &mut workspace)
+    }
+
+    /// External-distance search with caller-owned reusable workspace.
+    pub fn search_with_distance_and_workspace<F>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+    {
         assert!(k > 0, "k must be > 0");
         let ef = ef.max(k);
 
@@ -723,24 +1065,37 @@ impl<D: Distance> Hnsw<D> {
             Some(x) => x,
         };
 
-        let mut visited = VisitedTracker::new(self.vec_store.len());
-        let mut scratch = Scratch::new(ef);
-        let mut ep = Vec::with_capacity(ef);
+        workspace.prepare(self.vec_store.len(), ef);
+        let SearchWorkspace {
+            visited,
+            scratch,
+            entry_points,
+        } = workspace;
 
-        let ep_dist = self.metric.distance(query, self.vec_store.get(ep_id));
-        ep.push(DistId::new(ep_dist, ep_id));
+        let ep_dist = distance(ep_id);
+        entry_points.push(DistId::new(ep_dist, ep_id));
 
         for layer in (1..=ep_level).rev() {
-            Self::do_search_layer(
-                &self.vec_store, &self.connections, &self.metric,
-                &mut visited, &mut scratch, query, &ep, 1, layer,
+            Self::do_search_layer_with_distance(
+                &self.graph,
+                visited,
+                scratch,
+                entry_points,
+                1,
+                layer,
+                &distance,
             );
-            std::mem::swap(&mut ep, &mut scratch.out);
+            std::mem::swap(entry_points, &mut scratch.out);
         }
 
-        Self::do_search_layer(
-            &self.vec_store, &self.connections, &self.metric,
-            &mut visited, &mut scratch, query, &ep, ef, 0,
+        Self::do_search_layer_with_distance(
+            &self.graph,
+            visited,
+            scratch,
+            entry_points,
+            ef,
+            0,
+            &distance,
         );
         scratch.out.truncate(k);
         scratch.out.iter()
@@ -748,16 +1103,154 @@ impl<D: Distance> Hnsw<D> {
             .collect()
     }
 
+    /// Search while applying an eligibility predicate during layer-0
+    /// traversal.
+    ///
+    /// Rejected nodes remain navigation candidates, preserving connectivity
+    /// through mixed or highly selective graphs, but they never enter the
+    /// bounded result heap. Consequently `k` is applied to accepted nodes
+    /// rather than to an unfiltered top-k followed by post-filtering.
+    ///
+    /// The predicate receives the zero-based vector id. If fewer than `k`
+    /// accepted nodes are reachable, all accepted results found are returned.
+    pub fn search_filtered<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> bool,
+    {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_filtered_with_workspace(query, k, ef, accepts, &mut workspace)
+    }
+
+    /// Filtered search using caller-owned storage retained across queries.
+    ///
+    /// This combines the filter-before-top-k semantics of
+    /// [`Hnsw::search_filtered`] with the allocation reuse of
+    /// [`Hnsw::search_with_workspace`].
+    pub fn search_filtered_with_workspace<F>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> bool,
+    {
+        self.search_filtered_with_distance_and_workspace(
+            k,
+            ef,
+            |id| self.metric.distance(query, self.vec_store.get(id)),
+            accepts,
+            workspace,
+        )
+    }
+
+    /// Filtered graph traversal using an external distance-by-node function.
+    pub fn search_filtered_with_distance<F, A>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        accepts: A,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+    {
+        let mut workspace = SearchWorkspace::new(self.vec_store.len(), ef.max(k));
+        self.search_filtered_with_distance_and_workspace(
+            k,
+            ef,
+            distance,
+            accepts,
+            &mut workspace,
+        )
+    }
+
+    /// Filtered external-distance search with caller-owned reusable workspace.
+    pub fn search_filtered_with_distance_and_workspace<F, A>(
+        &self,
+        k: usize,
+        ef: usize,
+        distance: F,
+        accepts: A,
+        workspace: &mut SearchWorkspace,
+    ) -> Vec<SearchResult>
+    where
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+    {
+        assert!(k > 0, "k must be > 0");
+        let ef = ef.max(k);
+
+        let (ep_id, ep_level) = match self.entry_point {
+            None => return Vec::new(),
+            Some(entry_point) => entry_point,
+        };
+
+        workspace.prepare(self.vec_store.len(), ef);
+        let SearchWorkspace {
+            visited,
+            scratch,
+            entry_points,
+        } = workspace;
+
+        let entry_distance = distance(ep_id);
+        entry_points.push(DistId::new(entry_distance, ep_id));
+
+        // Upper layers are navigation-only and deliberately ignore the
+        // eligibility predicate.
+        for layer in (1..=ep_level).rev() {
+            Self::do_search_layer_with_distance(
+                &self.graph,
+                visited,
+                scratch,
+                entry_points,
+                1,
+                layer,
+                &distance,
+            );
+            std::mem::swap(entry_points, &mut scratch.out);
+        }
+
+        Self::do_search_layer_filtered_with_distance(
+            &self.graph,
+            visited,
+            scratch,
+            entry_points,
+            ef,
+            &accepts,
+            &distance,
+        );
+        scratch.out.truncate(k);
+        scratch
+            .out
+            .iter()
+            .map(|result| SearchResult {
+                id: result.id,
+                distance: result.dist,
+            })
+            .collect()
+    }
+
     #[inline] pub fn len(&self)              -> usize         { self.vec_store.len() }
     #[inline] pub fn is_empty(&self)         -> bool          { self.vec_store.len() == 0 }
     #[inline] pub fn get_vector(&self, id: usize) -> &[f32]  { self.vec_store.get(id) }
     #[inline] pub fn dim(&self)              -> Option<usize> { self.dim }
+    #[inline] pub fn config(&self)           -> &Config       { &self.config }
     pub fn max_level(&self) -> Option<usize> { self.entry_point.map(|(_, l)| l) }
 
     // ─── Level generation ─────────────────────────────────────────────────
 
     fn random_level(&mut self) -> usize {
-        let u: f64 = self.rng.gen::<f64>().max(f64::MIN_POSITIVE);
+        let u: f64 = self.rng.random::<f64>().max(f64::MIN_POSITIVE);
         (-u.ln() * self.config.m_l()).floor() as usize
     }
 
@@ -772,7 +1265,7 @@ impl<D: Distance> Hnsw<D> {
 
     fn search_layer_node(&mut self, q: usize, ef: usize, layer: usize) {
         let vec_store   = &self.vec_store;
-        let connections = &self.connections;
+        let graph       = &self.graph;
         let metric      = &self.metric;
         let visited     = &mut self.visited;
         let scratch     = &mut self.scratch;
@@ -786,13 +1279,12 @@ impl<D: Distance> Hnsw<D> {
             if visited.visit(ep_d.id) { scratch.push_entry(ep_d); }
         }
 
-        loop {
-            let c = match scratch.pop_candidate() { Some(c) => c, None => break };
-            let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
+        while let Some(c) = scratch.pop_candidate() {
+            let Some(worst) = scratch.worst_result_dist() else { break };
             if c.dist > worst { break; }
 
-            if let Some(nb_list) = connections.get(c.id).and_then(|nc| nc.get(layer)) {
-                for &(nb_u32, _) in nb_list {
+            if let Some(nb_list) = graph.neighbours(c.id, layer) {
+                for (nb_u32, _) in nb_list {
                     let nb = nb_u32 as usize;
                     if visited.visit(nb) {
                         let nb_dist = metric.distance(q_vec, vec_store.get(nb));
@@ -809,17 +1301,17 @@ impl<D: Distance> Hnsw<D> {
 
     // ─── search_layer (search path — takes explicit params) ───────────────
 
-    fn do_search_layer(
-        vec_store:    &VecStore,
-        connections:  &[Vec<Vec<(u32, f32)>>],
-        metric:       &D,
-        visited:      &mut VisitedTracker,
-        scratch:      &mut Scratch,
-        query:        &[f32],
+    fn do_search_layer_with_distance<F>(
+        graph: &GraphStore,
+        visited: &mut VisitedTracker,
+        scratch: &mut Scratch,
         entry_points: &[DistId],
-        ef:           usize,
-        layer:        usize,
-    ) {
+        ef: usize,
+        layer: usize,
+        distance: &F,
+    ) where
+        F: Fn(usize) -> f32,
+    {
         visited.begin();
         scratch.begin(ef);
 
@@ -827,19 +1319,73 @@ impl<D: Distance> Hnsw<D> {
             if visited.visit(ep.id) { scratch.push_entry(ep); }
         }
 
-        loop {
-            let c = match scratch.pop_candidate() { Some(c) => c, None => break };
-            let worst = match scratch.worst_result_dist() { Some(d) => d, None => break };
+        while let Some(c) = scratch.pop_candidate() {
+            let Some(worst) = scratch.worst_result_dist() else { break };
             if c.dist > worst { break; }
 
-            if let Some(nb_list) = connections.get(c.id).and_then(|nc| nc.get(layer)) {
-                for &(nb_u32, _) in nb_list {
+            if let Some(nb_list) = graph.neighbours(c.id, layer) {
+                for (nb_u32, _) in nb_list {
                     let nb = nb_u32 as usize;
                     if visited.visit(nb) {
-                        let nb_dist = metric.distance(query, vec_store.get(nb));
+                        let nb_dist = distance(nb);
                         let cur_worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
                         if nb_dist < cur_worst || scratch.results_len() < ef {
                             scratch.push_candidate(DistId::new(nb_dist, nb));
+                        }
+                    }
+                }
+            }
+        }
+        scratch.finish();
+    }
+
+    // ─── search_layer (filtered layer-0 search) ───────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn do_search_layer_filtered_with_distance<F, A>(
+        graph: &GraphStore,
+        visited: &mut VisitedTracker,
+        scratch: &mut Scratch,
+        entry_points: &[DistId],
+        ef: usize,
+        accepts: &A,
+        distance: &F,
+    ) where
+        F: Fn(usize) -> f32,
+        A: Fn(usize) -> bool,
+    {
+        visited.begin();
+        scratch.begin(ef);
+
+        for &entry in entry_points {
+            if visited.visit(entry.id) {
+                scratch.push_navigation(entry);
+                if accepts(entry.id) {
+                    scratch.push_result(entry);
+                }
+            }
+        }
+
+        while let Some(candidate) = scratch.pop_candidate() {
+            let worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
+            if scratch.results_len() >= ef && candidate.dist > worst {
+                break;
+            }
+
+            if let Some(neighbours) = graph.neighbours(candidate.id, 0) {
+                for (neighbour_id, _) in neighbours {
+                    let neighbour = neighbour_id as usize;
+                    if !visited.visit(neighbour) {
+                        continue;
+                    }
+
+                    let distance = distance(neighbour);
+                    let worst = scratch.worst_result_dist().unwrap_or(f32::INFINITY);
+                    if scratch.results_len() < ef || distance < worst {
+                        let neighbour = DistId::new(distance, neighbour);
+                        scratch.push_navigation(neighbour);
+                        if accepts(neighbour.id) {
+                            scratch.push_result(neighbour);
                         }
                     }
                 }
@@ -898,8 +1444,8 @@ impl<D: Distance> Hnsw<D> {
                 self.scratch.out.iter().map(|d| d.id).collect();
             let mut extra: Vec<DistId> = Vec::new();
             for &d in &self.scratch.out {
-                if let Some(nb_list) = self.connections.get(d.id).and_then(|nc| nc.get(layer)) {
-                    for &(nb_u32, _) in nb_list {
+                if let Some(nb_list) = self.graph.neighbours(d.id, layer) {
+                    for (nb_u32, _) in nb_list {
                         let nb = nb_u32 as usize;
                         if !seen_ids.contains(&nb) {
                             extra.push(DistId::new(self.dist(q, nb), nb));
@@ -920,10 +1466,10 @@ impl<D: Distance> Hnsw<D> {
         // Iterate candidates in closest-first order.  Accept candidate `e` iff
         // `d(q, e) ≤ d(e, s)` for every already-accepted neighbour `s`.
         // Equivalently, reject if any `s` is closer to `e` than `q` is.
-        for i in 0..cands.len() {
+        for candidate in cands {
             if self.select_buf.len() >= m { break; }
-            let e_dist = cands[i].dist;
-            let e_id   = cands[i].id;
+            let e_dist = candidate.dist;
+            let e_id   = candidate.id;
 
             let mut accept = true;
             for j in 0..self.select_buf.len() {
@@ -975,9 +1521,7 @@ impl<D: Distance> Hnsw<D> {
     fn prune_connections_heuristic(&mut self, node_id: usize, layer: usize, m_max: usize) {
         // ── Step 1: load stored (id, dist_from_node) into prune_buf ──────
         self.prune_buf.clear();
-        let conn_len = self.connections[node_id][layer].len();
-        for i in 0..conn_len {
-            let (nb_u32, dist) = self.connections[node_id][layer][i];
+        for (nb_u32, dist) in self.graph.neighbours(node_id, layer).into_iter().flatten() {
             self.prune_buf.push((nb_u32 as usize, dist));
         }
         // Sort closest-first by stored distance — no distance computation.
@@ -1025,10 +1569,10 @@ impl<D: Distance> Hnsw<D> {
         }
 
         // ── Step 3: write result back to the connection list ──────────────
-        self.connections[node_id][layer].clear();
+        self.graph.neighbours_mut(node_id, layer).clear();
         for i in 0..self.select_buf.len() {
             let (id, dist) = self.select_buf[i];
-            self.connections[node_id][layer].push((id as u32, dist));
+            self.graph.neighbours_mut(node_id, layer).push((id as u32, dist));
         }
     }
 
@@ -1039,10 +1583,10 @@ impl<D: Distance> Hnsw<D> {
         let max_level = self.entry_point.map(|(_, l)| l).unwrap_or(0);
         let mut layer_counts = vec![0usize; max_level + 1];
         let mut layer_edges  = vec![0usize; max_level + 1];
-        for node_conn in &self.connections {
-            for (l, conn) in node_conn.iter().enumerate() {
+        for node in 0..self.graph.node_count() {
+            for l in 0..self.graph.level_count(node) {
                 layer_counts[l] += 1;
-                layer_edges[l]  += conn.len();
+                layer_edges[l] += self.graph.neighbour_count(node, l);
             }
         }
         IndexStats { num_vectors: self.vec_store.len(), max_level, layer_counts, layer_edges }

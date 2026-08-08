@@ -3,7 +3,7 @@
 //! Run with:
 //!   cargo run --release --example store
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use fast_hnsw::distance::{Cosine, Euclidean};
 use fast_hnsw::labeled::LabeledIndex;
@@ -56,7 +56,7 @@ fn main() {
 
 // ─── 1. Bare Hnsw save / load ─────────────────────────────────────────────────
 
-fn demo_bare_persist(tmp: &PathBuf) {
+fn demo_bare_persist(tmp: &Path) {
     println!("\n=== 1. Bare Hnsw persist (owned load) ===");
 
     let mut index = Builder::new().m(16).ef_construction(100).seed(1).build(Euclidean);
@@ -82,7 +82,7 @@ fn demo_bare_persist(tmp: &PathBuf) {
 
 // ─── 2. LabeledIndex<u32> save / load ────────────────────────────────────────
 
-fn demo_labeled_u32(tmp: &PathBuf) {
+fn demo_labeled_u32(tmp: &Path) {
     println!("\n=== 2. LabeledIndex<u32> (classification label) ===");
 
     let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
@@ -114,7 +114,7 @@ fn demo_labeled_u32(tmp: &PathBuf) {
 
 // ─── 3. LabeledIndex<String> save / load ─────────────────────────────────────
 
-fn demo_labeled_string(tmp: &PathBuf) {
+fn demo_labeled_string(tmp: &Path) {
     println!("\n=== 3. LabeledIndex<String> (text tag) ===");
 
     let mut idx: LabeledIndex<Cosine, String> = Builder::new()
@@ -145,7 +145,7 @@ fn demo_labeled_string(tmp: &PathBuf) {
 
 // ─── 4. LabeledIndex<ClassLabel> (custom payload) ────────────────────────────
 
-fn demo_labeled_custom(tmp: &PathBuf) {
+fn demo_labeled_custom(tmp: &Path) {
     println!("\n=== 4. LabeledIndex<ClassLabel> (custom fixed-stride payload) ===");
 
     let mut idx: LabeledIndex<Euclidean, ClassLabel> = Builder::new()
@@ -169,7 +169,7 @@ fn demo_labeled_custom(tmp: &PathBuf) {
 
 // ─── 5. LabeledIndex mmap load ───────────────────────────────────────────────
 
-fn demo_labeled_mmap(tmp: &PathBuf) {
+fn demo_labeled_mmap(tmp: &Path) {
     println!("\n=== 5. LabeledIndex::load_mmap (zero-copy vector data) ===");
 
     let mut idx: LabeledIndex<Euclidean, String> = Builder::new()
@@ -194,7 +194,7 @@ fn demo_labeled_mmap(tmp: &PathBuf) {
 
 // ─── 6. PairedIndex (text + image embeddings) ─────────────────────────────────
 
-fn demo_paired_index(tmp: &PathBuf) {
+fn demo_paired_index(tmp: &Path) {
     println!("\n=== 6. PairedIndex<Cosine, Euclidean> (text ↔ image) ===");
 
     // Side A: 4-D text embeddings (Cosine similarity)
@@ -240,7 +240,7 @@ fn demo_paired_index(tmp: &PathBuf) {
 
 // ─── 7. PairedIndex mmap load ─────────────────────────────────────────────────
 
-fn demo_paired_mmap(tmp: &PathBuf) {
+fn demo_paired_mmap(tmp: &Path) {
     println!("\n=== 7. PairedIndex::load_mmap ===");
 
     let mut idx: PairedIndex<Euclidean, Euclidean> = Builder::new()

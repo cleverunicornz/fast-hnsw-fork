@@ -1,6 +1,6 @@
 # fast-hnsw
 
-A pure-Rust, dependency-free implementation of **Hierarchical Navigable Small World** (HNSW) approximate nearest-neighbour (ANN) search.
+A pure-Rust, dependency-light implementation of **Hierarchical Navigable Small World** (HNSW) approximate nearest-neighbour (ANN) search.
 
 > Malkov & Yashunin, *"Efficient and robust approximate nearest neighbor search using
 > Hierarchical Navigable Small World graphs"*, IEEE TPAMI 2018.
@@ -19,14 +19,15 @@ cargo add fast-hnsw
 - **Full algorithmic fidelity** — heuristic (Algorithm 4) and simple (Algorithm 3) neighbour selection; `extendCandidates`; `keepPrunedConnections`
 - **Two pruning strategies** — `PruneStrategy::Simple` (default, fastest) and `PruneStrategy::Heuristic` (full Algorithm 4 for all edges, opt-in)
 - **Five built-in distance metrics** — Euclidean, Squared Euclidean, Cosine, Dot-product, Manhattan; add your own with a one-method trait
-- **Persistence** — binary file format; `save` / `load` / `load_mmap`; vector section sits at a fixed offset so it can be memory-mapped as a `&[f32]` slice
+- **Mmap-native persistence** — `load_mmap` traverses vectors and HNSW adjacency records directly from one read-only mapping; graph-sized heap reconstruction is not required
+- **Optional low-bit mmap sidecar** — the companion [`fast-hnsw-quantized`](quantized/) crate scores 2–4 bit rows during traversal while callers retain exact-vector reranking policy
 - **Labeled index** — `LabeledIndex<D, L>` attaches a typed `Payload` to every vector (class label, text tag, secondary embedding, custom struct)
 - **Paired index** — `PairedIndex<A, B>` builds two independent HNSW graphs over the same items (text+image, query+doc); search from either side, retrieve both embeddings per result
 - **Custom payload** — implement two methods (`encode` / `decode`) to persist any type; fixed-stride types use a flat layout, variable-width types get an offset table
 - **Capacity hint** — pre-allocate for expected index size to minimise reallocation churn
 - **Ergonomic builder** — `.build(metric)` / `.build_labeled(metric)` / `.build_paired(ma, mb)`
 - **Reproducible** — optional fixed RNG seed
-- **Tested** — 41 unit tests + 14 doc-tests including recall regression, persistence round-trips, mmap loads, and paired-search correctness
+- **Tested** — 61 core unit tests, 11 quantized-sidecar tests, and 15 doc-tests including recall regression, persistence round-trips, mmap loads, corruption checks, and filtered search
 
 ---
 
@@ -34,12 +35,12 @@ cargo add fast-hnsw
 
 ```toml
 [dependencies]
-hnsw = { path = "." }
+fast-hnsw = { path = "." }
 ```
 
 ```rust
-use hnsw::{Builder, Hnsw, SearchResult};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, Hnsw, SearchResult};
+use fast_hnsw::distance::Euclidean;
 
 fn main() {
     let mut index: Hnsw<Euclidean> = Builder::new()
@@ -84,6 +85,12 @@ fn main() {
 |---|---|
 | `insert(Vec<f32>) -> usize` | Add a vector; returns its assigned id (0-based). |
 | `search(&[f32], k, ef) -> Vec<SearchResult>` | Return the `k` approximate nearest neighbours. |
+| `search_with_workspace(&[f32], k, ef, &mut SearchWorkspace)` | Reuse visited and heap storage across repeated searches. |
+| `search_filtered(&[f32], k, ef, predicate)` | Apply id eligibility during traversal; rejected nodes remain navigable but never enter top-k. |
+| `search_filtered_with_workspace(...)` | Combine in-traversal filtering with caller-owned reusable storage. |
+| `search_with_distance(...)` | Traverse the graph using a prepared external distance-by-node callback. |
+| `search_with_distance_and_workspace(...)` | Combine external scoring with reusable query storage. |
+| `search_filtered_with_distance(...)` | Combine external scoring with filter-before-top-k semantics. |
 | `get_vector(id) -> &[f32]` | Retrieve a stored vector by id. |
 | `len() / is_empty() / dim() / max_level()` | Index introspection. |
 | `stats() -> IndexStats` | Layer-by-layer node and edge counts. |
@@ -92,13 +99,51 @@ fn main() {
 
 ---
 
+### In-traversal filtering
+
+```rust
+let hits = index.search_filtered(&query, 10, 512, |id| allowed_ids.contains(&id));
+```
+
+The predicate runs when a node is discovered at layer 0. Rejected nodes may
+still connect the traversal to eligible regions, but only accepted nodes enter
+the bounded result heap. This enforces filtering before top-k selection and
+avoids the short-result behavior of retrieving `k` globally and filtering
+afterward.
+
+### Reusing query storage
+
+```rust
+use fast_hnsw::SearchWorkspace;
+
+let mut workspace = SearchWorkspace::new(index.len(), 512);
+for query in queries {
+    let hits = index.search_with_workspace(query, 10, 512, &mut workspace);
+    println!("nearest id: {}", hits[0].id);
+}
+```
+
+Give each concurrent worker its own workspace. It grows automatically and
+retains its visited stamps, candidate heap, result heap, and upper-layer entry
+buffer. The returned top-k vector remains caller-owned.
+
+### Low-bit mmap traversal
+
+The optional [`fast-hnsw-quantized`](quantized/) companion stores 2-, 3-, or
+4-bit transformed rows in a checksummed mmap sidecar. Its `QuantizedHnsw`
+adapter uses the external-distance seam above, including in-traversal filters
+and reusable workspaces. The graph remains independent of the codec, and exact
+vectors can stay in a separate mmap for final reranking.
+
+---
+
 ## Persistence
 
 Every index type can be saved to a single binary file and reloaded with or without memory-mapping.
 
 ```rust
-use hnsw::{Builder, persist};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, persist};
+use fast_hnsw::distance::Euclidean;
 
 let mut index = Builder::new().m(16).ef_construction(200).build(Euclidean);
 // … insert vectors …
@@ -106,14 +151,24 @@ let mut index = Builder::new().m(16).ef_construction(200).build(Euclidean);
 // Save
 persist::save(&index, "index.hnsw")?;
 
+// Save a smaller read-only serving snapshot (ID-only adjacency records)
+persist::save_compact(&index, "index.compact.hnsw")?;
+
 // Load (vectors copied into RAM)
 let loaded = persist::load("index.hnsw", Euclidean)?;
 
-// Load with memory-mapped vector section (zero RAM copy; OS manages pages)
+// Load with memory-mapped vectors and graph (no graph-sized heap copy)
 // Ideal for indexes larger than available RAM.
 // Insert into a mmap-backed index will panic.
 let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
+let compact_mmap = persist::load_mmap("index.compact.hnsw", Euclidean)?;
 ```
+
+The default v1 format preserves build-time edge distances and supports owned,
+mutable reloads. The compact v2 format drops those distances because query
+traversal recomputes distances from vectors; it uses four bytes per directed
+edge instead of eight and is deliberately mmap/read-only. Existing v1 files
+remain fully compatible.
 
 ### File format
 
@@ -122,12 +177,16 @@ let mmap = persist::load_mmap("index.hnsw", Euclidean)?;
 [256 .. ]       Vectors        n × dim × 4 bytes (f32 LE, row-major) ← mmap-able
 [after vecs]    Levels         n × u32 — layer count per node
 [after levels]  Conn offsets   n × u64 — absolute byte offsets into conn data
-[at offsets]    Conn data      per-node: per-layer u32 count + (u32,f32) pairs
+[at offsets]    Conn data      v1: per-layer count + (u32,f32) pairs
+                                v2: per-layer count + u32 neighbor ids
 [after graph]   Payload hdr    payload_count · stride (0 = variable)
                 Payload data   [optional offset table] + raw encoded bytes
 ```
 
-The vector section always begins at byte 256 — a fixed, known offset — so `mmap + pointer arithmetic` gives a `&[f32]` slice with zero reformatting.
+The vector section always begins at byte 256, so `mmap + pointer arithmetic`
+gives a `&[f32]` slice with zero reformatting. Levels and connection offsets
+provide random access to variable-width adjacency records; search decodes each
+little-endian edge as it traverses the mapped graph.
 
 ---
 
@@ -136,8 +195,8 @@ The vector section always begins at byte 256 — a fixed, known offset — so `m
 A `LabeledIndex<D, L>` stores one value of type `L` alongside every vector.  Results from `search()` carry both the distance and a reference to the payload.
 
 ```rust
-use hnsw::{Builder, labeled::LabeledIndex};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, labeled::LabeledIndex};
+use fast_hnsw::distance::Euclidean;
 
 // ── Classification label (u32) ────────────────────────────────────────────────
 let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
@@ -171,6 +230,14 @@ idx.insert(vec![1.0, 0.0], vec![0.9f32, 0.1, 0.0]);  // 3-D secondary
 idx.save("my.hnsw")?;
 let loaded = LabeledIndex::<Euclidean, Vec<f32>>::load("my.hnsw", Euclidean)?;
 let mmap   = LabeledIndex::<Euclidean, Vec<f32>>::load_mmap("my.hnsw", Euclidean)?;
+
+// Fixed-width payloads can also remain mapped. Values are decoded individually
+// instead of materializing the full payload column as Vec<u32>.
+let mapped = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(
+    "classes.hnsw", Euclidean,
+)?;
+let class: u32 = mapped.get_payload(0)?;
+let hits = mapped.search(&[0.9, 0.1], 3, 50)?;
 ```
 
 ---
@@ -180,8 +247,8 @@ let mmap   = LabeledIndex::<Euclidean, Vec<f32>>::load_mmap("my.hnsw", Euclidean
 A `PairedIndex<A, B>` maintains **two HNSW graphs** over the same items — one per embedding space — allowing search from either side.
 
 ```rust
-use hnsw::{Builder, paired::PairedIndex};
-use hnsw::distance::{Cosine, Euclidean};
+use fast_hnsw::{Builder, paired::PairedIndex};
+use fast_hnsw::distance::{Cosine, Euclidean};
 
 // text_dim=4 (Cosine), image_dim=3 (Euclidean)
 let mut idx: PairedIndex<Cosine, Euclidean> = Builder::new()
@@ -231,7 +298,7 @@ let mmap   = PairedIndex::<Cosine, Euclidean>::load_mmap("my_index", Cosine, Euc
 Any type can be persisted alongside vectors by implementing two methods:
 
 ```rust
-use hnsw::payload::{Payload, DecodeError};
+use fast_hnsw::payload::{Payload, DecodeError};
 
 #[derive(Clone)]
 struct MyLabel { category: u16, score: f32 }
@@ -296,8 +363,8 @@ Run the full paper Algorithm 4 diversity check, exploiting stored distances to e
 - **Recall**: full Algorithm 4 quality; recovers the ≈ 1 pp gap vs `Simple` on high-dimensional data.
 
 ```rust
-use hnsw::{Builder, PruneStrategy};
-use hnsw::distance::Euclidean;
+use fast_hnsw::{Builder, PruneStrategy};
+use fast_hnsw::distance::Euclidean;
 
 // Default — fastest, beats hnsw_rs on both speed and recall:
 let fast = Builder::new()
@@ -355,7 +422,7 @@ The storage overhead is 4 extra bytes per edge (8 bytes total vs 4 for a bare `u
 
 ---
 
-## Benchmark — ours vs. `hnsw_rs v0.3.3` and `hnsw v0.11` (rust-cv)
+## Benchmark — ours vs. `hnsw_rs v0.3.4` and `hnsw v0.11` (rust-cv)
 
 > **Setup:** M = 16 · ef\_construction = 200 · K = 10 · 500 queries · metric = L2(f32)
 > Single-threaded · release build · ground truth = brute-force exact L2.
@@ -508,7 +575,7 @@ For every combination of **workload** (n=1k/10k/50k × dim=32/128) and **index t
 | Save MB/s | `file_size / save_time` |
 | Load time | Wall-clock time to read all bytes into RAM |
 | Load MB/s | `file_size / load_time` |
-| mmap time | Wall-clock time to map the file + deserialize graph (vector bytes **not** read) |
+| mmap time | Wall-clock time to map and validate graph bounds (vectors and adjacency records are not copied) |
 | mmap speedup | `load_time / mmap_time` |
 
 ### Save throughput
@@ -576,6 +643,20 @@ cargo bench --bench compare -- --full      # scale to 1 M  (~hours)
 cargo bench --bench persist                # default workloads (≤ 50k)
 cargo bench --bench persist -- --full      # scale to 1 M  (~hours)
 
+# Real-embedding recall and retained mmap snapshot
+cargo bench --bench fvecs -- \
+  --fvecs /path/to/corpus.fvecs --rows 100000 --queries 100 \
+  --snapshot /tmp/corpus.hnsw
+
+# Process-isolated mmap open/query timing (wrap with the platform RSS tool)
+/usr/bin/time -l target/release/deps/mmap_fvecs-<hash> \
+  --index /tmp/corpus.hnsw --fvecs /path/to/corpus.fvecs --queries 100
+
+# Add the same one-in-four eligibility fixture used by the comparison harness
+target/release/deps/mmap_fvecs-<hash> \
+  --index /tmp/corpus.hnsw --fvecs /path/to/corpus.fvecs \
+  --queries 100 --filter-modulo 4
+
 # Regenerate all figures
 python3 figures/plot_bench.py              # bench_fig1–4
 python3 figures/plot_benchmarks.py         # fig1–7 (3-library comparison)
@@ -604,7 +685,9 @@ hnsw/
 ├── benches/
 │   ├── bench.rs        Standalone wall-clock timing (ours only); writes bench.jsonl
 │   ├── compare.rs      3-library comparison (ours/hnsw_rs/hnsw v0.11); writes compare.jsonl
-│   └── persist.rs      Save / load / mmap-load timing + file sizes; writes persist.csv
+│   ├── persist.rs      Save / load / mmap-load timing + file sizes; writes persist.csv
+│   ├── fvecs.rs        Real-embedding recall + retained snapshot lifecycle gate
+│   └── mmap_fvecs.rs   Process-isolated mapped-open/query profile
 ├── examples/
 │   ├── demo.rs         Core HNSW walkthrough
 │   └── store.rs        Persistence + LabeledIndex + PairedIndex demos

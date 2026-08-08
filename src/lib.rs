@@ -1,4 +1,4 @@
-//! # hnsw
+//! # fast-hnsw
 //!
 //! A pure-Rust implementation of **Hierarchical Navigable Small World** (HNSW)
 //! approximate nearest-neighbour search, following the algorithm from:
@@ -10,8 +10,8 @@
 //! ## Quick start
 //!
 //! ```rust
-//! use hnsw::{Builder, Hnsw, SearchResult};
-//! use hnsw::distance::Euclidean;
+//! use fast_hnsw::{Builder, Hnsw, SearchResult};
+//! use fast_hnsw::distance::Euclidean;
 //!
 //! // Build an index.
 //! let mut index: Hnsw<Euclidean> = Builder::new()
@@ -55,8 +55,8 @@ pub mod payload;
 pub mod persist;
 
 pub use builder::Builder;
-pub use hnsw::{Config, Hnsw, IndexStats, PruneStrategy, SearchResult};
-pub use labeled::LabeledIndex;
+pub use hnsw::{Config, Hnsw, IndexStats, PruneStrategy, SearchResult, SearchWorkspace};
+pub use labeled::{LabeledIndex, MappedLabeledIndex, MappedLabeledResult};
 pub use paired::PairedIndex;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ mod tests {
     // ── helpers ──────────────────────────────────────────────────────────
 
     fn build_index(n: usize, dim: usize, seed: u64) -> Hnsw<Euclidean> {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 1_000);
         let mut index = Builder::new()
             .m(16)
@@ -80,7 +80,7 @@ mod tests {
             .seed(seed)
             .build(Euclidean);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v);
         }
         index
@@ -163,6 +163,120 @@ mod tests {
     }
 
     #[test]
+    fn filtered_search_applies_filter_before_top_k() {
+        let mut index = Builder::new()
+            .m(16)
+            .ef_construction(100)
+            .seed(44)
+            .build(Euclidean);
+        for id in 0..100 {
+            index.insert(vec![id as f32]);
+        }
+
+        let results = index.search_filtered(&[12.1], 3, 100, |id| id % 10 == 0);
+        assert_eq!(
+            results.iter().map(|result| result.id).collect::<Vec<_>>(),
+            [10, 20, 0]
+        );
+    }
+
+    #[test]
+    fn filtered_search_navigates_through_rejected_nodes() {
+        let mut index = Builder::new()
+            .m(16)
+            .ef_construction(100)
+            .seed(45)
+            .build(Euclidean);
+        for id in 0..100 {
+            index.insert(vec![id as f32]);
+        }
+
+        let results = index.search_filtered(&[0.0], 1, 100, |id| id == 99);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, 99);
+    }
+
+    #[test]
+    fn filtered_search_handles_empty_eligibility_set() {
+        let index = build_index(100, 4, 46);
+        let results = index.search_filtered(&[0.5; 4], 10, 100, |_| false);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn reusable_workspace_preserves_search_and_filter_results() {
+        let index = build_index(200, 16, 47);
+        let query = [0.5; 16];
+        let expected = index.search(&query, 10, 50);
+        let expected_filtered = index.search_filtered(&query, 10, 50, |id| id % 3 == 0);
+
+        let mut workspace = SearchWorkspace::default();
+        assert_eq!(
+            index.search_with_workspace(&query, 10, 50, &mut workspace),
+            expected
+        );
+        assert_eq!(
+            index.search_filtered_with_workspace(
+                &query,
+                10,
+                50,
+                |id| id % 3 == 0,
+                &mut workspace,
+            ),
+            expected_filtered
+        );
+        assert_eq!(
+            index.search_with_workspace(&query, 10, 100, &mut workspace),
+            index.search(&query, 10, 100)
+        );
+    }
+
+    #[test]
+    fn external_distance_search_preserves_results_and_filtering() {
+        let index = build_index(200, 16, 48);
+        let vectors = (0..index.len())
+            .map(|id| index.get_vector(id).to_vec())
+            .collect::<Vec<_>>();
+        let query = [0.35; 16];
+        let distance = |id: usize| {
+            vectors[id]
+                .iter()
+                .zip(query)
+                .map(|(candidate, query)| {
+                    let difference = candidate - query;
+                    difference * difference
+                })
+                .sum::<f32>()
+                .sqrt()
+        };
+
+        assert_eq!(
+            index.search_with_distance(10, 75, distance),
+            index.search(&query, 10, 75)
+        );
+        assert_eq!(
+            index.search_filtered_with_distance(10, 75, distance, |id| id % 4 == 0),
+            index.search_filtered(&query, 10, 75, |id| id % 4 == 0)
+        );
+
+        let mut workspace = SearchWorkspace::default();
+        assert_eq!(
+            index.search_with_distance_and_workspace(10, 75, distance, &mut workspace),
+            index.search(&query, 10, 75)
+        );
+        assert_eq!(
+            index.search_filtered_with_distance_and_workspace(
+                10,
+                75,
+                distance,
+                |id| id % 4 == 0,
+                &mut workspace,
+            ),
+            index.search_filtered(&query, 10, 75, |id| id % 4 == 0)
+        );
+    }
+
+    #[test]
     fn stored_vectors_are_retrievable() {
         let mut index = Builder::new().seed(5).build(Euclidean);
         let vecs = vec![vec![1.0f32, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
@@ -193,7 +307,7 @@ mod tests {
     // ── recall tests ──────────────────────────────────────────────────────
 
     fn recall(index: &Hnsw<Euclidean>, vectors: &[Vec<f32>], k: usize, ef: usize, n_queries: usize) -> f64 {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99_999);
         let dim = vectors[0].len();
 
@@ -201,7 +315,7 @@ mod tests {
         let mut total = 0usize;
 
         for _ in 0..n_queries {
-            let query: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let query: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             let exact = exact_knn(vectors, &query, k);
             let approx: Vec<usize> = index.search(&query, k, ef).iter().map(|r| r.id).collect();
             let exact_set: std::collections::HashSet<usize> = exact.into_iter().collect();
@@ -218,7 +332,7 @@ mod tests {
 
     #[test]
     fn recall_128d_is_acceptable() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(77);
         let dim = 128;
         let n = 1_000;
@@ -231,7 +345,7 @@ mod tests {
             .build(Euclidean);
 
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             vectors.push(v);
         }
@@ -244,7 +358,7 @@ mod tests {
 
     #[test]
     fn recall_32d_high_ef_is_near_perfect() {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(55);
         let dim = 32;
         let n = 500;
@@ -257,7 +371,7 @@ mod tests {
             .build(Euclidean);
 
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             vectors.push(v);
         }
@@ -369,12 +483,12 @@ mod tests {
     // ── Persistence tests ─────────────────────────────────────────────────
 
     fn make_hnsw(n: usize, dim: usize, seed: u64) -> (Hnsw<Euclidean>, Vec<Vec<f32>>) {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 5_000);
         let mut index = Builder::new().m(16).ef_construction(200).seed(seed).build(Euclidean);
         let mut corpus = Vec::with_capacity(n);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             corpus.push(v);
         }
@@ -416,6 +530,10 @@ mod tests {
         persist::save(&orig, &path).expect("save failed");
 
         let mmap = persist::load_mmap(&path, Euclidean).expect("mmap load failed");
+        assert!(matches!(
+            &mmap.graph,
+            crate::hnsw::GraphStore::Mapped(_)
+        ));
         assert_eq!(orig.len(), mmap.len());
         for i in 0..orig.len() {
             assert_eq!(orig.get_vector(i), mmap.get_vector(i),
@@ -427,6 +545,301 @@ mod tests {
         for (a, b) in r_orig.iter().zip(r_mmap.iter()) {
             assert_eq!(a.id, b.id);
         }
+        let filtered_orig = orig.search_filtered(&q, 5, 200, |id| id % 7 == 0);
+        let filtered_mmap = mmap.search_filtered(&q, 5, 200, |id| id % 7 == 0);
+        assert_eq!(filtered_orig, filtered_mmap);
+    }
+
+    #[test]
+    fn compact_snapshot_is_smaller_and_search_equivalent() {
+        let (orig, _) = make_hnsw(200, 16, 303);
+        let dir = tempdir();
+        let v1_path = dir.join("full-v1.hnsw");
+        let v2_path = dir.join("compact-v2.hnsw");
+        persist::save(&orig, &v1_path).expect("v1 save failed");
+
+        // Re-encoding an existing mmap snapshot is an important production
+        // path: compacting does not require rebuilding the graph.
+        let v1_mmap =
+            persist::load_mmap(&v1_path, Euclidean).expect("v1 mmap load failed");
+        persist::save_compact(&v1_mmap, &v2_path).expect("v2 save failed");
+
+        let mut edge_count = 0;
+        for node in 0..orig.graph.node_count() {
+            for layer in 0..orig.graph.level_count(node) {
+                edge_count += orig.graph.neighbour_count(node, layer);
+            }
+        }
+        let v1_bytes = std::fs::metadata(&v1_path).expect("v1 metadata failed").len();
+        let v2_bytes = std::fs::metadata(&v2_path).expect("v2 metadata failed").len();
+        assert_eq!(v1_bytes - v2_bytes, edge_count as u64 * 4);
+
+        let compact =
+            persist::load_mmap(&v2_path, Euclidean).expect("v2 mmap load failed");
+        assert_eq!(orig.len(), compact.len());
+        for i in 0..orig.len() {
+            assert_eq!(orig.get_vector(i), compact.get_vector(i));
+        }
+
+        let query = vec![0.3f32; 16];
+        assert_eq!(
+            orig.search(&query, 10, 100),
+            compact.search(&query, 10, 100)
+        );
+        assert_eq!(
+            orig.search_filtered(&query, 10, 200, |id| id % 7 == 0),
+            compact.search_filtered(&query, 10, 200, |id| id % 7 == 0)
+        );
+
+        let compact_labeled_path = dir.join("compact-labeled-v2.hnsw");
+        let mut labeled = Builder::new().seed(303).build_labeled(Euclidean);
+        for id in 0..orig.len() {
+            labeled.insert(orig.get_vector(id).to_vec(), id as u32);
+        }
+        labeled
+            .save_compact(&compact_labeled_path)
+            .expect("compact labeled save failed");
+        let mapped = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(
+            &compact_labeled_path,
+            Euclidean,
+        )
+        .expect("compact labeled mmap load failed");
+        let expected = mapped.search(&query, 10, 100).expect("mapped search failed");
+        let mut workspace = SearchWorkspace::default();
+        let actual = mapped
+            .search_with_workspace(&query, 10, 100, &mut workspace)
+            .expect("workspace search failed");
+        assert_eq!(
+            actual.iter().map(|result| result.id).collect::<Vec<_>>(),
+            expected.iter().map(|result| result.id).collect::<Vec<_>>()
+        );
+        let expected = mapped
+            .search_filtered(&query, 10, 200, |id, _| id % 7 == 0)
+            .expect("mapped filtered search failed");
+        let actual = mapped
+            .search_filtered_with_workspace(
+                &query,
+                10,
+                200,
+                |id, _| id % 7 == 0,
+                &mut workspace,
+            )
+            .expect("workspace filtered search failed");
+        assert_eq!(
+            actual.iter().map(|result| result.id).collect::<Vec<_>>(),
+            expected.iter().map(|result| result.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_owned_load() {
+        let (index, _) = make_hnsw(20, 8, 304);
+        let dir = tempdir();
+        let path = dir.join("compact-owned.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let error = persist::load(&path, Euclidean)
+            .err()
+            .expect("owned compact load should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("read-only"));
+        assert!(error.to_string().contains("load_mmap"));
+    }
+
+    #[test]
+    fn compact_snapshot_supports_variable_and_fixed_payloads() {
+        let (index, _) = make_hnsw(30, 8, 305);
+        let dir = tempdir();
+
+        let string_path = dir.join("compact-strings.hnsw");
+        let strings: Vec<String> = (0..index.len()).map(|id| format!("item-{id}")).collect();
+        persist::save_compact_with_payload(&index, &strings, &string_path)
+            .expect("compact variable payload save failed");
+        let (string_index, loaded_strings) =
+            persist::load_mmap_with_payload::<_, String>(&string_path, Euclidean)
+                .expect("compact variable payload mmap load failed");
+        assert_eq!(loaded_strings, strings);
+        assert_eq!(string_index.len(), index.len());
+
+        let fixed_path = dir.join("compact-u32.hnsw");
+        let labels: Vec<u32> = (0..index.len() as u32).map(|id| id * 10).collect();
+        persist::save_compact_with_payload(&index, &labels, &fixed_path)
+            .expect("compact fixed payload save failed");
+        let (fixed_index, mapped_labels) =
+            persist::load_mmap_with_fixed_payload::<_, u32>(&fixed_path, Euclidean)
+                .expect("compact fixed payload mmap load failed");
+        assert_eq!(fixed_index.len(), index.len());
+        for (id, expected) in labels.iter().copied().enumerate() {
+            assert_eq!(mapped_labels.get(id).expect("payload decode failed"), expected);
+        }
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_truncated_adjacency() {
+        let (index, _) = make_hnsw(20, 8, 306);
+        let dir = tempdir();
+        let path = dir.join("compact-truncated.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        let len = file.metadata().expect("metadata failed").len();
+        file.set_len(len - 17).expect("truncate failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("truncated compact adjacency should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("connection list"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_out_of_range_neighbour() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 307);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-neighbour.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let offsets_start = 256 + n * dim * 4 + n * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(offsets_start as u64))
+            .expect("seek failed");
+        let mut offset = [0; 8];
+        file.read_exact(&mut offset).expect("offset read failed");
+        let first_record = u64::from_le_bytes(offset);
+        file.seek(SeekFrom::Start(first_record))
+            .expect("record seek failed");
+        let mut count = [0; 4];
+        file.read_exact(&mut count).expect("count read failed");
+        assert!(u32::from_le_bytes(count) > 0);
+        file.write_all(&(n as u32).to_le_bytes())
+            .expect("neighbour write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("out-of-range neighbour should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid neighbour id"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_out_of_range_entry_point() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let (index, _) = make_hnsw(n, 8, 308);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-entry-point.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(52)).expect("seek failed");
+        file.write_all(&(n as u64).to_le_bytes())
+            .expect("entry-point write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("out-of-range entry point should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("entry-point id"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_vector_size_overflow() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let (index, _) = make_hnsw(20, 8, 309);
+        let dir = tempdir();
+        let path = dir.join("compact-vector-overflow.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(20)).expect("seek failed");
+        file.write_all(&u64::MAX.to_le_bytes())
+            .expect("dimension write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("overflowing vector dimensions should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("vector"));
+    }
+
+    #[test]
+    fn compact_snapshot_rejects_implausible_node_level() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 310);
+        let dir = tempdir();
+        let path = dir.join("compact-invalid-level.hnsw");
+        persist::save_compact(&index, &path).expect("compact save failed");
+
+        let levels_start = 256 + n * dim * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(levels_start as u64))
+            .expect("seek failed");
+        file.write_all(&u32::MAX.to_le_bytes())
+            .expect("level write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("implausible node level should fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("supported maximum"));
+    }
+
+    #[test]
+    fn persist_mmap_rejects_invalid_graph_offset() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let n = 20;
+        let dim = 8;
+        let (index, _) = make_hnsw(n, dim, 302);
+        let dir = tempdir();
+        let path = dir.join("bad_graph_offset.hnsw");
+        persist::save(&index, &path).expect("save failed");
+
+        let offsets_start = 256 + n * dim * 4 + n * 4;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        file.seek(SeekFrom::Start(offsets_start as u64))
+            .expect("seek failed");
+        file.write_all(&0u64.to_le_bytes()).expect("write failed");
+        drop(file);
+
+        let error = persist::load_mmap(&path, Euclidean)
+            .err()
+            .expect("invalid graph offset should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("invalid connection offset"));
     }
 
     #[test]
@@ -453,6 +866,34 @@ mod tests {
         let hits = idx.search(&[0.1, 0.0], 1, 20);
         assert_eq!(hits[0].payload, &10_u32);
         assert_eq!(hits[0].id, 0);
+
+        let filtered = idx.search_filtered(&[0.1, 0.0], 2, 20, |_id, payload| *payload >= 20);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|result| *result.payload >= 20));
+    }
+
+    #[test]
+    fn seeded_labeled_builder_is_byte_reproducible() {
+        let build = || {
+            let mut index = Builder::new()
+                .m(8)
+                .ef_construction(32)
+                .seed(400)
+                .build_labeled(Euclidean);
+            for id in 0..200_u32 {
+                index.insert(vec![id as f32, (id % 17) as f32], id);
+            }
+            index
+        };
+        let directory = tempdir();
+        let left = directory.join("seeded-labeled-left.hnsw");
+        let right = directory.join("seeded-labeled-right.hnsw");
+        build().save_compact(&left).expect("left save failed");
+        build().save_compact(&right).expect("right save failed");
+        assert_eq!(
+            std::fs::read(left).expect("left read failed"),
+            std::fs::read(right).expect("right read failed")
+        );
     }
 
     #[test]
@@ -556,6 +997,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn labeled_fixed_payloads_stay_mapped() {
+        let mut idx: LabeledIndex<Euclidean, u32> =
+            Builder::new().seed(421).build_labeled(Euclidean);
+        for i in 0..30_u32 {
+            idx.insert(vec![i as f32], i * 10);
+        }
+        let dir = tempdir();
+        let path = dir.join("labeled_fixed_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let mmap = LabeledIndex::<Euclidean, u32>::load_mmap_fixed(&path, Euclidean)
+            .expect("fixed mmap load failed");
+        assert!(matches!(
+            &mmap.inner.graph,
+            crate::hnsw::GraphStore::Mapped(_)
+        ));
+        assert_eq!(mmap.len(), 30);
+        for i in 0..30_usize {
+            assert_eq!(mmap.get_payload(i).expect("payload decode failed"), i as u32 * 10);
+        }
+        assert_eq!(
+            mmap.get_payload(30).expect_err("out-of-range id should fail").kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let hits = mmap.search(&[12.0], 1, 20).expect("search failed");
+        assert_eq!(hits[0].id, 12);
+        assert_eq!(hits[0].payload, 120);
+        assert_eq!(hits[0].embedding, &[12.0]);
+
+        let filtered = mmap
+            .search_filtered(&[12.0], 3, 30, |_id, payload| *payload % 40 == 0)
+            .expect("filtered search failed");
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].id, 12);
+        assert!(filtered.iter().all(|result| result.payload % 40 == 0));
+    }
+
+    #[test]
+    fn labeled_mapped_payloads_reject_variable_width_types() {
+        let mut idx: LabeledIndex<Euclidean, String> =
+            Builder::new().seed(422).build_labeled(Euclidean);
+        idx.insert(vec![1.0], "one".to_string());
+        let dir = tempdir();
+        let path = dir.join("labeled_variable_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let error = LabeledIndex::<Euclidean, String>::load_mmap_fixed(&path, Euclidean)
+            .err()
+            .expect("variable-width mapped payload should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn labeled_mapped_payloads_reject_truncated_columns() {
+        let mut idx: LabeledIndex<Euclidean, u64> =
+            Builder::new().seed(423).build_labeled(Euclidean);
+        idx.insert(vec![1.0], 10);
+        idx.insert(vec![2.0], 20);
+        let dir = tempdir();
+        let path = dir.join("labeled_truncated_mmap.hnsw");
+        idx.save(&path).expect("save failed");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open failed");
+        let truncated_len = file.metadata().expect("metadata failed").len() - 1;
+        file.set_len(truncated_len).expect("truncate failed");
+        drop(file);
+
+        let error = LabeledIndex::<Euclidean, u64>::load_mmap_fixed(&path, Euclidean)
+            .err()
+            .expect("truncated mapped payload should be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("payload column"));
+    }
+
     // ── PairedIndex tests ─────────────────────────────────────────────────
 
     #[test]
@@ -578,6 +1098,37 @@ mod tests {
         let hits_b = idx.search_by_b(&[0.1, 0.9, 0.0], 1, 20);
         assert_eq!(hits_b[0].id, 1);
         assert_eq!(hits_b[0].emb_a, &[0.0f32, 1.0]);
+    }
+
+    #[test]
+    fn seeded_paired_builder_is_byte_reproducible() {
+        let build = || {
+            let mut index = Builder::new()
+                .m(8)
+                .ef_construction(32)
+                .seed(500)
+                .build_paired(Euclidean, Euclidean);
+            for id in 0..200_u32 {
+                index.insert(
+                    vec![id as f32, (id % 11) as f32],
+                    vec![(id % 13) as f32, id as f32],
+                );
+            }
+            index
+        };
+        let directory = tempdir();
+        let left = directory.join("seeded-paired-left");
+        let right = directory.join("seeded-paired-right");
+        build().save(&left).expect("left save failed");
+        build().save(&right).expect("right save failed");
+        for side in ["_a.hnsw", "_b.hnsw"] {
+            let left = std::path::PathBuf::from(format!("{}{side}", left.display()));
+            let right = std::path::PathBuf::from(format!("{}{side}", right.display()));
+            assert_eq!(
+                std::fs::read(left).expect("left read failed"),
+                std::fs::read(right).expect("right read failed")
+            );
+        }
     }
 
     #[test]
@@ -670,7 +1221,7 @@ mod tests {
     fn build_with_prune(n: usize, dim: usize, seed: u64, ps: PruneStrategy)
         -> (Hnsw<Euclidean>, Vec<Vec<f32>>)
     {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed + 2_000);
         let mut index = Builder::new()
             .m(16)
@@ -680,7 +1231,7 @@ mod tests {
             .build(Euclidean);
         let mut corpus = Vec::with_capacity(n);
         for _ in 0..n {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>()).collect();
+            let v: Vec<f32> = (0..dim).map(|_| rng.random::<f32>()).collect();
             index.insert(v.clone());
             corpus.push(v);
         }

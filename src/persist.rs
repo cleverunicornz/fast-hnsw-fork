@@ -11,7 +11,7 @@
 //! ┌─────────────────────────────────────────────────────────── offset 0
 //! │  HEADER  (256 bytes, zero-padded)
 //! │    0..8   magic     b"HNSWNDX\0"
-//! │    8..12  version   u32 = 1
+//! │    8..12  version   u32 = 1 (mutable) or 2 (compact mmap-only)
 //! │   12..20  n         u64  — number of vectors
 //! │   20..28  dim       u64  — vector dimension
 //! │   28..36  m         u64
@@ -35,7 +35,8 @@
 //! │    For node i (at conn_offsets[i]):
 //! │      For each layer 0 ..= levels[i]:
 //! │        n_conns : u32
-//! │        [(id: u32, dist: f32); n_conns]   8 bytes each
+//! │        v1: [(id: u32, dist: f32); n_conns]   8 bytes each
+//! │        v2: [id: u32; n_conns]                 4 bytes each
 //! ├─────────────────────────────────────────────────────────── (variable)
 //! │  PAYLOAD HEADER  (16 bytes)
 //! │    payload_count  : u64  — number of payload entries (= n, or 0)
@@ -93,17 +94,73 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::distance::Distance;
-use crate::hnsw::{Config, Hnsw, PruneStrategy, VecStore};
+use crate::hnsw::{Config, GraphStore, Hnsw, OwnedGraph, PruneStrategy, VecStore};
 use crate::payload::Payload;
+
+/// Lazy, read-only view over a fixed-width payload column in an index mmap.
+///
+/// Values are decoded on access from their little-endian wire representation;
+/// the full payload column is never copied into a `Vec<L>`.
+pub struct MappedPayloads<L: Payload> {
+    mmap: Arc<memmap2::Mmap>,
+    data_offset: usize,
+    count: usize,
+    stride: usize,
+    marker: PhantomData<L>,
+}
+
+impl<L: Payload> MappedPayloads<L> {
+    /// Number of payload entries.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Whether the payload column is empty.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Decode one payload directly from the mapped file.
+    pub fn get(&self, id: usize) -> io::Result<L> {
+        if id >= self.count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("payload id {id} out of bounds for {} entries", self.count),
+            ));
+        }
+        let start = self.data_offset + id * self.stride;
+        let end = start + self.stride;
+        let (payload, consumed) = L::decode(&self.mmap[start..end])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if consumed != self.stride {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "fixed payload decoder consumed {consumed} bytes; expected {}",
+                    self.stride
+                ),
+            ));
+        }
+        Ok(payload)
+    }
+}
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 
 pub(crate) const MAGIC:           &[u8; 8] = b"HNSWNDX\0";
 pub(crate) const VERSION:         u32       = 1;
+pub(crate) const COMPACT_VERSION: u32       = 2;
+const FULL_EDGE_STRIDE:           usize     = 8;
+const COMPACT_EDGE_STRIDE:        usize     = 4;
+// `random_level` clamps its random input to f64::MIN_POSITIVE and M is at
+// least two, so a writer created by this crate cannot produce a level this
+// high. Keeping an explicit ceiling makes corrupted snapshots cheap to reject.
+const MAX_MAPPED_LEVEL:            usize     = 2_048;
 /// Byte offset where the vector data begins (fixed, so callers can mmap it).
 pub(crate) const VECTORS_OFFSET:  usize     = 256;
 
@@ -128,6 +185,15 @@ fn read_u64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
 }
 
+fn read_usize(buf: &[u8], off: usize, field: &str) -> io::Result<usize> {
+    usize::try_from(read_u64(buf, off)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{field} does not fit in memory"),
+        )
+    })
+}
+
 fn u32_le(v: u32) -> [u8; 4] { v.to_le_bytes() }
 fn u64_le(v: u64) -> [u8; 8] { v.to_le_bytes() }
 fn f32_le(v: f32) -> [u8; 4] { v.to_le_bytes() }
@@ -140,16 +206,19 @@ fn f32_le(v: f32) -> [u8; 4] { v.to_le_bytes() }
 /// Used to pre-allocate the file on disk before the first write, which
 /// allows the OS to reserve a contiguous extent and avoids incremental
 /// metadata updates.
-fn hnsw_section_bytes<D: Distance>(index: &Hnsw<D>) -> u64 {
+fn hnsw_section_bytes<D: Distance>(index: &Hnsw<D>, edge_stride: usize) -> u64 {
     let n   = index.vec_store.len();
     let dim = index.dim.unwrap_or(0);
 
     // Sum the connection-data bytes: for each node, for each layer,
     // 4 bytes (n_conns) + n_conns × 8 bytes (id + dist pairs).
-    let conn_bytes: u64 = index.connections.iter()
-        .flat_map(|node_conn| node_conn.iter())
-        .map(|layer_conn| 4 + (layer_conn.len() as u64) * 8)
-        .sum();
+    let mut conn_bytes = 0u64;
+    for node in 0..index.graph.node_count() {
+        for layer in 0..index.graph.level_count(node) {
+            conn_bytes +=
+                4 + (index.graph.neighbour_count(node, layer) as u64) * edge_stride as u64;
+        }
+    }
 
     VECTORS_OFFSET as u64          // fixed header
     + (n as u64) * (dim as u64) * 4   // vectors
@@ -178,7 +247,7 @@ pub fn save<D: Distance>(index: &Hnsw<D>, path: impl AsRef<Path>) -> io::Result<
     // Pre-allocate the exact file size so the OS can assign a contiguous
     // disk extent in one shot.  Errors are silently ignored — this is a
     // pure performance hint and does not affect correctness.
-    let total = hnsw_section_bytes(index)
+    let total = hnsw_section_bytes(index, FULL_EDGE_STRIDE)
         + 16; // empty payload header (payload_count=0, stride=0)
     let _ = file.set_len(total);
 
@@ -210,13 +279,61 @@ where
     // Pre-allocate for fixed-stride payloads (exact size known without
     // encoding).  Variable-width payloads require encoding to know sizes;
     // we skip pre-allocation there to avoid the extra encoding pass.
-    let graph_bytes = hnsw_section_bytes(index);
+    let graph_bytes = hnsw_section_bytes(index, FULL_EDGE_STRIDE);
     if let Some(payload_bytes) = fixed_payload_section_bytes::<L>(payloads.len()) {
         let _ = file.set_len(graph_bytes + payload_bytes);
     }
 
     let mut w = BufWriter::new(file);
     write_hnsw(index, &mut w)?;
+    write_payloads(payloads, &mut w)?;
+    w.flush()
+}
+
+/// Serialize a compact, read-only snapshot with ID-only adjacency records.
+///
+/// Compact snapshots can be opened with [`load_mmap`] and are suitable for
+/// serving and archival. They intentionally cannot be opened with [`load`]
+/// because the omitted build-time edge distances are required for mutation.
+pub fn save_compact<D: Distance>(
+    index: &Hnsw<D>,
+    path: impl AsRef<Path>,
+) -> io::Result<()> {
+    let file = File::create(path)?;
+    let total = hnsw_section_bytes(index, COMPACT_EDGE_STRIDE) + 16;
+    let _ = file.set_len(total);
+
+    let mut w = BufWriter::new(file);
+    write_hnsw_format(index, &mut w, COMPACT_VERSION, COMPACT_EDGE_STRIDE)?;
+    write_empty_payload(&mut w)?;
+    w.flush()
+}
+
+/// Serialize a compact, read-only snapshot together with payloads.
+pub fn save_compact_with_payload<D, L>(
+    index: &Hnsw<D>,
+    payloads: &[L],
+    path: impl AsRef<Path>,
+) -> io::Result<()>
+where
+    D: Distance,
+    L: Payload,
+{
+    assert_eq!(
+        payloads.len(),
+        index.len(),
+        "payload count ({}) must match index size ({})",
+        payloads.len(),
+        index.len()
+    );
+    let file = File::create(path)?;
+    let graph_bytes = hnsw_section_bytes(index, COMPACT_EDGE_STRIDE);
+    if let Some(payload_bytes) = fixed_payload_section_bytes::<L>(payloads.len()) {
+        let _ = file.set_len(graph_bytes + payload_bytes);
+    }
+
+    let mut w = BufWriter::new(file);
+    write_hnsw_format(index, &mut w, COMPACT_VERSION, COMPACT_EDGE_STRIDE)?;
     write_payloads(payloads, &mut w)?;
     w.flush()
 }
@@ -253,15 +370,12 @@ where
 
 // ─── Public load (mmap) ──────────────────────────────────────────────────────
 
-/// Load an index from `path`, keeping vector data **memory-mapped**.
+/// Load an index from `path`, keeping vectors and graph **memory-mapped**.
 ///
-/// The vector section of the file is mapped read-only into the process
-/// address space; the OS page cache manages which pages are physically
-/// resident.  Subsequent `search()` calls trigger page faults only for the
-/// vectors they actually touch — ideal for indexes larger than RAM.
-///
-/// The graph structure (connections, levels) is still deserialized into heap
-/// memory because it is variable-width.
+/// Vectors, levels, connection offsets, and adjacency records remain in the
+/// read-only file mapping. The OS page cache manages which pages are resident;
+/// search decodes little-endian edge records directly as it traverses them.
+/// No graph-sized heap allocation or adjacency-list deserialization occurs.
 ///
 /// ## Behaviour
 /// * Inserts into a mmap-backed index will panic (it is read-only).
@@ -273,8 +387,8 @@ pub fn load_mmap<D: Distance>(path: impl AsRef<Path>, metric: D) -> io::Result<H
 
 /// Mmap-load an index **and** its payload.
 ///
-/// The vector section stays memory-mapped (no heap copy).  Payload entries
-/// are decoded from the existing mapping — no second `File::open` or seek.
+/// Vectors and graph stay memory-mapped (no heap copy). Payload entries are
+/// decoded from the existing mapping — no second `File::open` or seek.
 pub fn load_mmap_with_payload<D, L>(
     path:   impl AsRef<Path>,
     metric: D,
@@ -298,6 +412,29 @@ where
     Ok((index, payloads))
 }
 
+/// Mmap-load an index and retain a fixed-width payload column in the mapping.
+///
+/// Unlike [`load_mmap_with_payload`], this function does not allocate or
+/// decode a `Vec<L>` at open. Use [`MappedPayloads::get`] to decode individual
+/// values. Variable-width payload types are rejected.
+pub fn load_mmap_with_fixed_payload<D, L>(
+    path: impl AsRef<Path>,
+    metric: D,
+) -> io::Result<(Hnsw<D>, MappedPayloads<L>)>
+where
+    D: Distance,
+    L: Payload,
+{
+    let file = File::open(path.as_ref())?;
+    let (index, payload_start, mmap) = read_hnsw_mmap_inner(file, metric)?;
+    let payloads = map_fixed_payloads::<L>(
+        Arc::clone(&mmap),
+        payload_start,
+        index.len(),
+    )?;
+    Ok((index, payloads))
+}
+
 // ─── Core write ──────────────────────────────────────────────────────────────
 
 /// Write the Hnsw index to `w` (header + vectors + levels + conn-offsets +
@@ -310,6 +447,15 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     index: &Hnsw<D>,
     w:     &mut W,
 ) -> io::Result<()> {
+    write_hnsw_format(index, w, VERSION, FULL_EDGE_STRIDE)
+}
+
+fn write_hnsw_format<D: Distance, W: Write>(
+    index: &Hnsw<D>,
+    w: &mut W,
+    version: u32,
+    edge_stride: usize,
+) -> io::Result<()> {
     let n   = index.vec_store.len();
     let dim = index.dim.unwrap_or(0);
     let cfg = &index.config;
@@ -317,7 +463,7 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     // ── Header (256 bytes, zero-padded) ──────────────────────────────────
     let mut hdr = [0u8; VECTORS_OFFSET];
     hdr[..8].copy_from_slice(MAGIC);
-    hdr[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&u32_le(VERSION));
+    hdr[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&u32_le(version));
     hdr[OFF_N..OFF_N + 8].copy_from_slice(&u64_le(n as u64));
     hdr[OFF_DIM..OFF_DIM + 8].copy_from_slice(&u64_le(dim as u64));
     hdr[OFF_M..OFF_M + 8].copy_from_slice(&u64_le(cfg.m as u64));
@@ -342,8 +488,8 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     w.write_all(index.vec_store.as_bytes())?;
 
     // ── Levels ────────────────────────────────────────────────────────────
-    for node_conn in &index.connections {
-        let level = (node_conn.len() as u32).saturating_sub(1);
+    for node in 0..index.graph.node_count() {
+        let level = (index.graph.level_count(node) as u32).saturating_sub(1);
         w.write_all(&u32_le(level))?;
     }
 
@@ -369,11 +515,12 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
         + (n as u64) * 8;
 
     let mut running_off = conn_data_base;
-    for node_conn in &index.connections {
+    for node in 0..index.graph.node_count() {
         w.write_all(&u64_le(running_off))?;
-        for layer_conn in node_conn {
+        for layer in 0..index.graph.level_count(node) {
             // 4 bytes for n_conns header + 8 bytes per (id, dist) pair.
-            running_off += 4 + (layer_conn.len() as u64) * 8;
+            running_off +=
+                4 + (index.graph.neighbour_count(node, layer) as u64) * edge_stride as u64;
         }
     }
 
@@ -383,16 +530,18 @@ pub(crate) fn write_hnsw<D: Distance, W: Write>(
     // and written with one write_all call — one syscall per layer instead of
     // three (n_conns header + id + dist) per pair.
     let mut conn_buf: Vec<u8> = Vec::new();
-    for node_conn in &index.connections {
-        for layer_conn in node_conn {
-            let n_conns = layer_conn.len();
+    for node in 0..index.graph.node_count() {
+        for layer in 0..index.graph.level_count(node) {
+            let n_conns = index.graph.neighbour_count(node, layer);
             // Reserve: 4 bytes for n_conns + 8 bytes per pair.
             conn_buf.clear();
-            conn_buf.reserve(4 + n_conns * 8);
+            conn_buf.reserve(4 + n_conns * edge_stride);
             conn_buf.extend_from_slice(&u32_le(n_conns as u32));
-            for &(id, dist) in layer_conn {
+            for (id, dist) in index.graph.neighbours(node, layer).into_iter().flatten() {
                 conn_buf.extend_from_slice(&u32_le(id));
-                conn_buf.extend_from_slice(&f32_le(dist));
+                if edge_stride == FULL_EDGE_STRIDE {
+                    conn_buf.extend_from_slice(&f32_le(dist));
+                }
             }
             w.write_all(&conn_buf)?;
         }
@@ -411,7 +560,13 @@ fn read_hnsw_owned<D: Distance, R: Read + Seek>(
     metric:          D,
     _expect_payload: bool,
 ) -> io::Result<(Hnsw<D>, u64)> {
-    let (cfg, n, dim, ep, vec_offset, _file_size) = read_header(r)?;
+    let (version, cfg, n, dim, ep, vec_offset, _file_size) = read_header(r)?;
+    if version == COMPACT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "compact v2 snapshots are read-only; open with load_mmap",
+        ));
+    }
 
     // ── Vectors (owned copy) ──────────────────────────────────────────────
     r.seek(SeekFrom::Start(vec_offset as u64))?;
@@ -430,13 +585,20 @@ fn read_hnsw_owned<D: Distance, R: Read + Seek>(
     // ── Graph ─────────────────────────────────────────────────────────────
     let (connections, payload_pos) = read_graph(r, n)?;
 
-    let index = Hnsw::from_parts(cfg, metric, vs, connections, ep, if dim == 0 { None } else { Some(dim) });
+    let index = Hnsw::from_parts(
+        cfg,
+        metric,
+        vs,
+        GraphStore::from_owned(connections),
+        ep,
+        if dim == 0 { None } else { Some(dim) },
+    );
     Ok((index, payload_pos))
 }
 
 // ─── Core read (mmap) ────────────────────────────────────────────────────────
 
-/// Open `file`, mmap its vector section, and deserialize the graph.
+/// Open `file` and keep its vectors and graph in one read-only mapping.
 ///
 /// Returns `(index, payload_section_start, arc_mmap)`.  The `Arc<Mmap>` is
 /// provided so the caller can read the payload section from the existing
@@ -457,34 +619,62 @@ fn read_hnsw_mmap_inner<D: Distance>(
     let _ = mmap.advise(memmap2::Advice::Random);
 
     let mut cursor = io::Cursor::new(mmap.as_ref() as &[u8]);
-    let (cfg, n, dim, ep, vec_offset, _file_size) = read_header(&mut cursor)?;
+    let (version, cfg, n, dim, ep, vec_offset, _file_size) =
+        read_header(&mut cursor)?;
+    let edge_stride = edge_stride_for_version(version)?;
 
     // Bounds check: vector section must fit inside the mapping.
-    let vec_bytes = n * dim * 4;
-    if vec_offset + vec_bytes > mmap.len() {
+    let vec_values = n.checked_mul(dim).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector value count overflow")
+    })?;
+    let vec_bytes = vec_values.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector section size overflow")
+    })?;
+    let vec_end = vec_offset.checked_add(vec_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "vector section position overflow")
+    })?;
+    if vec_end > mmap.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file too short: vector section extends past end of file",
         ));
     }
+    if vec_offset % std::mem::align_of::<f32>() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "vector section is not aligned for f32 access",
+        ));
+    }
 
-    let vs = VecStore::from_mmap(Arc::clone(&mmap), vec_offset, n, dim);
+    let vs = VecStore::from_mmap(Arc::clone(&mmap), vec_offset, vec_values, dim);
 
-    // Graph lives after the vector section — read with the cursor.
-    cursor.seek(SeekFrom::Start((vec_offset + vec_bytes) as u64))?;
-    let (connections, payload_pos) = read_graph(&mut cursor, n)?;
+    // Levels, offsets, and adjacency records remain in the mapping. Validate
+    // their bounds once at open, then let search decode edge pairs lazily.
+    let levels_offset = vec_end;
+    let payload_pos = validate_mapped_graph(&mmap, levels_offset, n, edge_stride)?;
+    validate_mapped_entry_point(&mmap, levels_offset, n, ep)?;
+    let graph =
+        GraphStore::from_mmap(Arc::clone(&mmap), levels_offset, n, edge_stride);
 
-    let index = Hnsw::from_parts(cfg, metric, vs, connections, ep, if dim == 0 { None } else { Some(dim) });
+    let index = Hnsw::from_parts(
+        cfg,
+        metric,
+        vs,
+        graph,
+        ep,
+        if dim == 0 { None } else { Some(dim) },
+    );
     Ok((index, payload_pos, mmap))
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
 /// Parse the 256-byte fixed header.  Returns
-/// `(config, n, dim, entry_point, vec_section_byte_offset, file_size_hint)`.
+/// `(version, config, n, dim, entry_point, vec_section_byte_offset,
+/// file_size_hint)`.
 fn read_header<R: Read + Seek>(
     r: &mut R,
-) -> io::Result<(Config, usize, usize, Option<(usize, usize)>, usize, u64)> {
+) -> io::Result<(u32, Config, usize, usize, Option<(usize, usize)>, usize, u64)> {
     let mut hdr = [0u8; VECTORS_OFFSET];
     r.read_exact(&mut hdr)?;
 
@@ -495,20 +685,22 @@ fn read_header<R: Read + Seek>(
         ));
     }
     let version = read_u32(&hdr, OFF_VERSION);
-    if version != VERSION {
+    if version != VERSION && version != COMPACT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported file version {version} (expected {VERSION})"),
+            format!(
+                "unsupported file version {version} (expected {VERSION} or {COMPACT_VERSION})"
+            ),
         ));
     }
 
-    let n        = read_u64(&hdr, OFF_N)  as usize;
-    let dim      = read_u64(&hdr, OFF_DIM) as usize;
-    let m        = read_u64(&hdr, OFF_M)  as usize;
-    let m0       = read_u64(&hdr, OFF_M0) as usize;
-    let ef       = read_u64(&hdr, OFF_EF) as usize;
-    let ep_id    = read_u64(&hdr, OFF_EP_ID) as usize;
-    let ep_level = read_u64(&hdr, OFF_EP_LEVEL) as usize;
+    let n        = read_usize(&hdr, OFF_N, "vector count")?;
+    let dim      = read_usize(&hdr, OFF_DIM, "vector dimension")?;
+    let m        = read_usize(&hdr, OFF_M, "M")?;
+    let m0       = read_usize(&hdr, OFF_M0, "M0")?;
+    let ef       = read_usize(&hdr, OFF_EF, "ef_construction")?;
+    let raw_ep_id = read_u64(&hdr, OFF_EP_ID);
+    let ep_level = read_usize(&hdr, OFF_EP_LEVEL, "entry-point level")?;
 
     let use_heuristic      = hdr[OFF_FLAGS] != 0;
     let extend_candidates  = hdr[OFF_FLAGS + 1] != 0;
@@ -522,11 +714,52 @@ fn read_header<R: Read + Seek>(
         )),
     };
 
-    let entry_point = if ep_id == usize::MAX {
+    let entry_point = if raw_ep_id == u64::MAX {
         None
     } else {
+        let ep_id = usize::try_from(raw_ep_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "entry-point id does not fit in memory",
+            )
+        })?;
         Some((ep_id, ep_level))
     };
+
+    if m < 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "M must be at least 2",
+        ));
+    }
+    if ef < m {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ef_construction must be at least M",
+        ));
+    }
+    match (n, dim, entry_point) {
+        (0, 0, None) => {}
+        (0, _, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty index has inconsistent dimensions or entry point",
+            ));
+        }
+        (_, 0, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty index has zero dimensions",
+            ));
+        }
+        (_, _, None) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "non-empty index is missing its entry point",
+            ));
+        }
+        _ => {}
+    }
 
     let config = Config {
         m,
@@ -544,7 +777,26 @@ fn read_header<R: Read + Seek>(
     let end = r.seek(SeekFrom::End(0))?;
     r.seek(SeekFrom::Start(pos))?;
 
-    Ok((config, n, dim, entry_point, VECTORS_OFFSET, end))
+    Ok((
+        version,
+        config,
+        n,
+        dim,
+        entry_point,
+        VECTORS_OFFSET,
+        end,
+    ))
+}
+
+fn edge_stride_for_version(version: u32) -> io::Result<usize> {
+    match version {
+        VERSION => Ok(FULL_EDGE_STRIDE),
+        COMPACT_VERSION => Ok(COMPACT_EDGE_STRIDE),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported file version {version}"),
+        )),
+    }
 }
 
 /// Read the levels + conn-offsets + conn-data sections from the current
@@ -561,7 +813,7 @@ fn read_header<R: Read + Seek>(
 fn read_graph<R: Read + Seek>(
     r: &mut R,
     n: usize,
-) -> io::Result<(Vec<Vec<Vec<(u32, f32)>>>, u64)> {
+) -> io::Result<(OwnedGraph, u64)> {
     // ── Levels: one bulk read of n × 4 bytes ─────────────────────────────
     let mut raw_levels = vec![0u8; n * 4];
     r.read_exact(&mut raw_levels)?;
@@ -585,7 +837,7 @@ fn read_graph<R: Read + Seek>(
     // order, so we read straight through without seeking.  Each layer's
     // (id, dist) pairs are bulk-read into a single byte buffer and decoded
     // in one pass.
-    let mut connections: Vec<Vec<Vec<(u32, f32)>>> = Vec::with_capacity(n);
+    let mut connections: OwnedGraph = Vec::with_capacity(n);
     let mut pair_buf: Vec<u8> = Vec::new();
     let mut buf4 = [0u8; 4];
 
@@ -624,7 +876,218 @@ fn read_graph<R: Read + Seek>(
     Ok((connections, payload_pos))
 }
 
+/// Validate the memory-mapped graph tables and records without materializing
+/// adjacency lists. Returns the byte offset of the payload section.
+fn validate_mapped_graph(
+    mmap: &[u8],
+    levels_offset: usize,
+    n: usize,
+    edge_stride: usize,
+) -> io::Result<u64> {
+    let levels_bytes = n.checked_mul(4).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "levels table size overflow")
+    })?;
+    let offsets_bytes = n.checked_mul(8).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "offset table size overflow")
+    })?;
+    let offsets_offset = levels_offset.checked_add(levels_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "offset table position overflow")
+    })?;
+    let data_offset = offsets_offset.checked_add(offsets_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "graph data position overflow")
+    })?;
+    if data_offset > mmap.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: graph tables extend past end of file",
+        ));
+    }
+
+    let mut position = data_offset;
+    for node in 0..n {
+        let level_pos = levels_offset + node * 4;
+        let level = u32::from_le_bytes(
+            mmap[level_pos..level_pos + 4].try_into().unwrap(),
+        ) as usize;
+        if level > MAX_MAPPED_LEVEL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("node {node} level {level} exceeds supported maximum {MAX_MAPPED_LEVEL}"),
+            ));
+        }
+
+        let offset_pos = offsets_offset + node * 8;
+        let recorded = u64::from_le_bytes(
+            mmap[offset_pos..offset_pos + 8].try_into().unwrap(),
+        );
+        if recorded != position as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid connection offset for node {node}: {recorded} != {position}"
+                ),
+            ));
+        }
+
+        for _ in 0..=level {
+            let count_end = position.checked_add(4).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection position overflow")
+            })?;
+            let count_bytes = mmap.get(position..count_end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file too short: missing connection count",
+                )
+            })?;
+            let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+            let edge_bytes = count.checked_mul(edge_stride).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection list size overflow")
+            })?;
+            let edge_end = count_end.checked_add(edge_bytes).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "connection position overflow")
+            })?;
+            let edges = mmap.get(count_end..edge_end).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "file too short: connection list extends past end of file",
+                )
+            })?;
+            for edge in edges.chunks_exact(edge_stride) {
+                let neighbour = u32::from_le_bytes(edge[..4].try_into().unwrap()) as usize;
+                if neighbour >= n {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid neighbour id {neighbour} for index with {n} nodes"
+                        ),
+                    ));
+                }
+            }
+            position = edge_end;
+        }
+    }
+
+    Ok(position as u64)
+}
+
+fn validate_mapped_entry_point(
+    mmap: &[u8],
+    levels_offset: usize,
+    n: usize,
+    entry_point: Option<(usize, usize)>,
+) -> io::Result<()> {
+    let Some((id, level)) = entry_point else {
+        if n == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "non-empty index is missing its entry point",
+        ));
+    };
+    if id >= n {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("entry-point id {id} is out of range for {n} nodes"),
+        ));
+    }
+    let level_pos = levels_offset
+        .checked_add(id.checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "entry-point level position overflow")
+        })?)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "entry-point level position overflow")
+        })?;
+    let stored_level = mmap
+        .get(level_pos..level_pos + 4)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry-point level is missing"))?;
+    let stored_level = u32::from_le_bytes(stored_level.try_into().unwrap()) as usize;
+    if level != stored_level {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "entry-point level {level} does not match node {id} level {stored_level}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ─── Payload I/O ─────────────────────────────────────────────────────────────
+
+fn map_fixed_payloads<L: Payload>(
+    mmap: Arc<memmap2::Mmap>,
+    payload_section_pos: u64,
+    expected_count: usize,
+) -> io::Result<MappedPayloads<L>> {
+    let payload_section_pos = usize::try_from(payload_section_pos).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload section position does not fit in memory",
+        )
+    })?;
+    let header_end = payload_section_pos.checked_add(16).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload header position overflow")
+    })?;
+    let header = mmap.get(payload_section_pos..header_end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: missing payload header",
+        )
+    })?;
+    let count = usize::try_from(read_u64(header, 0)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload count does not fit in memory",
+        )
+    })?;
+    let stride = usize::try_from(read_u64(header, 8)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload stride does not fit in memory",
+        )
+    })?;
+
+    if count != expected_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload count {count} != index size {expected_count}"),
+        ));
+    }
+    let expected_stride = L::fixed_stride().filter(|stride| *stride > 0).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mapped payload access requires a non-zero fixed-width Payload",
+        )
+    })?;
+    if stride != expected_stride {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("payload stride {stride} != type stride {expected_stride}"),
+        ));
+    }
+
+    let payload_bytes = count.checked_mul(stride).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload column size overflow")
+    })?;
+    let data_end = header_end.checked_add(payload_bytes).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "payload column position overflow")
+    })?;
+    if data_end > mmap.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too short: fixed payload column extends past end of file",
+        ));
+    }
+
+    Ok(MappedPayloads {
+        mmap,
+        data_offset: header_end,
+        count,
+        stride,
+        marker: PhantomData,
+    })
+}
 
 /// Write a zero-entry payload section (marker for "no payload").
 pub(crate) fn write_empty_payload<W: Write>(w: &mut W) -> io::Result<()> {

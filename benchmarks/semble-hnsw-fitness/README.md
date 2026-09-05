@@ -23,6 +23,12 @@ exact dense retrieval, exclusions, RRF, boosting, and reranking. Every hash must
 match the owned release above. A package that merely reports version `0.7.0`
 but contains different code is rejected.
 
+The `cvu-agent-code-x64` image is intentionally required to pre-provision that
+Semble release and the pinned model snapshot. The workflow does not install or
+download either one and sets `HF_HUB_OFFLINE=1`; fixture generation is the
+authoritative enforcement point for distribution version, owned source hashes,
+model name, model dimension, and model-output identity.
+
 ## Controls
 
 The generator constructs a fresh code-only Semble index from a clean corpus
@@ -44,6 +50,14 @@ The Rust harness first reconstructs every exact-dense hybrid control and
 requires exact chunk order plus a `1e-10` score tolerance. That gate catches a
 ranking contract mismatch before any HNSW result can be reported.
 
+Fixture generation also requires the dense index to be exactly
+`semble.index.dense.SelectableBasicBackend`. For query `y01`, it decodes the
+same little-endian bytes written to the fixture, performs direct brute-force
+cosine against every row, and requires top-50 set parity, top-1 parity, and
+score parity with the recorded Semble result. Each shadow set independently
+serializes path membership and must exactly match Semble's
+`indices_for_paths(...)` oracle before filtered controls are recorded.
+
 ## Measurements
 
 Separate child processes build sequential, 2-worker, 3-worker, and 4-worker
@@ -51,8 +65,11 @@ graphs with `M=32`, `M0=64`, `ef_construction=400`, simple reverse pruning,
 seed `20260905`, heuristic selection enabled, extend-candidates disabled, and
 keep-pruned enabled. A child records graph build, compact persistence, mmap
 open, query evaluation, artifact bytes/hash, graph statistics, and Linux
-`VmHWM` peak RSS. It becomes ready only after the persisted graph is reopened
-and all checks finish; exact search is never a candidate fallback.
+`VmHWM` whole-child peak RSS. The high-water mark includes fixture residency,
+graph construction, persistence, mmap validation, and mmap query page faults;
+it is not construction-only RSS. A graph becomes ready only after the
+persisted graph is reopened and all checks finish; exact search is never a
+candidate fallback.
 
 The sequential graph is byte-reproducible from the fixed seed and insertion
 order. The library's parallel builder deliberately does not promise identical
@@ -69,9 +86,12 @@ the reciprocal rank of Semble's top-1 result in the candidate top-10.
 Filtered search uses nested 0-, 10-, and 50-file shadow sets selected
 deterministically from exact-dense neighborhoods. It compares HNSW with exact
 cosine over the same eligible chunk IDs, fails on any excluded emission, and
-records rejected nodes observed during traversal. A small unit test also locks
-the graph property that rejected nodes can relay navigation without entering
-the result heap.
+records rejected nodes observed during traversal. Filtered latency uses the
+same warmup and repeated timing counts as dense latency. A nonempty short
+result is quality evidence, not a harness failure: every query records
+`accepted_returned`, and Recall@k keeps the exact eligible top-k as its
+denominator. A small unit test also locks the graph property that rejected
+nodes can relay navigation without entering the result heap.
 
 BM25 generation and current Semble hybrid timings remain recorded separately
 from HNSW traversal and Rust reconstruction timings. The summary does not add
@@ -124,4 +144,7 @@ gh run list \
 The manual workflow is bound to `cvu-agent-code-x64`, uses
 `secrets.GH_PAT_REPOS` only for the exact corpus checkout, enforces 4 exposed
 CPUs and at least 30 GiB RAM, appends the Markdown result to
-`GITHUB_STEP_SUMMARY`, and uploads the receipt, fixture, and HNSW files.
+`GITHUB_STEP_SUMMARY`, and uploads the receipt, fixture, and HNSW files. Receipt
+gate booleans are computed from oracle evidence, checksums, build artifacts,
+and per-query records; no successful gate is emitted as an unconditional
+literal.

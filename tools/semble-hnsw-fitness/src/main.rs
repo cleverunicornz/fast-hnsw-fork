@@ -14,9 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use semble_hnsw_fitness::{
-    control_agreement, load_fixture, recall_metrics, reconstruct_hybrid, sha256_file,
-    target_metrics, verify_hybrid_controls, ControlAgreement, Fixture, RecallMetrics,
-    TargetMetrics, EXPECTED_DIMENSION, RECEIPT_SCHEMA_VERSION,
+    control_agreement, load_fixture, recall_metrics, reconstruct_hybrid,
+    returned_count_summary, sha256_file, target_metrics, validate_filtered_candidates,
+    verify_hybrid_controls, ControlAgreement, Fixture, RecallMetrics, ReturnedCountSummary,
+    TargetMetrics, EXPECTED_CORPUS_REPOSITORY, EXPECTED_CORPUS_SHA, EXPECTED_DIMENSION,
+    EXPECTED_MODEL, EXPECTED_SEMBLE_REPOSITORY, EXPECTED_SEMBLE_SHA, EXPECTED_SEMBLE_TAG,
+    EXPECTED_SEMBLE_VERSION, RECEIPT_SCHEMA_VERSION,
 };
 
 const EFS: [usize; 5] = [50, 100, 200, 400, 800];
@@ -45,7 +48,7 @@ struct BuildReceipt {
     config: BuildConfig,
     phase_timings_ms: PhaseTimings,
     artifact: ArtifactReceipt,
-    peak_rss_bytes: Option<u64>,
+    child_peak_rss_bytes: Option<u64>,
     graph: GraphReceipt,
     evaluations: Vec<EfEvaluation>,
 }
@@ -122,6 +125,7 @@ struct FilteredEvaluation {
     shadow_set: String,
     shadow_file_count: usize,
     aggregate: RecallMetrics,
+    accepted_returned: ReturnedCountSummary,
     latency_us: LatencySummary,
     rejected_nodes_observed: usize,
     shadowed_file_emitted: bool,
@@ -132,6 +136,8 @@ struct FilteredEvaluation {
 struct FilteredQueryReceipt {
     query_id: String,
     recall: RecallMetrics,
+    accepted_returned: usize,
+    latency_us: LatencySummary,
     rejected_nodes_observed: usize,
     exact_top_10: Vec<usize>,
     hnsw_top_10: Vec<usize>,
@@ -184,6 +190,37 @@ struct HardwareFacts {
     target_memory_match: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+struct ReceiptGates {
+    owned_semble_source_verified: bool,
+    model_and_dimension_verified: bool,
+    corpus_revision_and_cleanliness_verified: bool,
+    fixture_binary_checksums_verified: bool,
+    dense_control_exactness_verified: bool,
+    shadow_oracle_membership_verified: bool,
+    hybrid_control_reconstructed: bool,
+    all_worker_builds_persisted_and_mmap_opened: bool,
+    all_results_complete: bool,
+    accept_all_filter_matches_dense_hnsw: bool,
+    no_shadowed_file_emitted: bool,
+}
+
+impl ReceiptGates {
+    fn all_passed(&self) -> bool {
+        self.owned_semble_source_verified
+            && self.model_and_dimension_verified
+            && self.corpus_revision_and_cleanliness_verified
+            && self.fixture_binary_checksums_verified
+            && self.dense_control_exactness_verified
+            && self.shadow_oracle_membership_verified
+            && self.hybrid_control_reconstructed
+            && self.all_worker_builds_persisted_and_mmap_opened
+            && self.all_results_complete
+            && self.accept_all_filter_matches_dense_hnsw
+            && self.no_shadowed_file_emitted
+    }
+}
+
 fn main() {
     if let Err(error) = real_main() {
         eprintln!("semble-hnsw-fitness failed: {error}");
@@ -229,7 +266,22 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
     }
 
     let loaded = load_fixture(&options.fixture_dir)?;
-    verify_hybrid_controls(&loaded.fixture).map_err(invalid)?;
+    let hybrid_control_check = verify_hybrid_controls(&loaded.fixture);
+    let hybrid_control_reconstructed = hybrid_control_check.is_ok();
+    if let Err(error) = hybrid_control_check {
+        return Err(invalid(error));
+    }
+    let fixture_binary_checksums_verified = sha256_file(
+        &options.fixture_dir.join(&loaded.fixture.vectors.file),
+    )? == loaded.fixture.vectors.sha256
+        && sha256_file(
+            &options
+                .fixture_dir
+                .join(&loaded.fixture.query_vectors.file),
+        )? == loaded.fixture.query_vectors.sha256;
+    if !fixture_binary_checksums_verified {
+        return Err(invalid("fixture binary checksum verification failed"));
+    }
     let fixture = loaded.fixture;
     drop(loaded.vectors);
     drop(loaded.query_vectors);
@@ -257,6 +309,7 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
 
     let executable = env::current_exe()?;
     let mut builds = Vec::new();
+    let mut build_artifacts_verified = true;
     for workers in WORKERS {
         let shard = options.output_dir.join(format!("build-{workers}.partial.json"));
         let artifact = options
@@ -286,17 +339,32 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
             )));
         }
         let build: BuildReceipt = serde_json::from_slice(&fs::read(&shard)?)?;
-        validate_build_receipt(
+        let build_validation = validate_build_receipt(
             &build,
             &fixture,
             &fast_hnsw_git_sha,
             &artifact,
             workers,
-        )?;
+        );
+        build_artifacts_verified = build_artifacts_verified && build_validation.is_ok();
+        build_validation?;
         fs::remove_file(shard)?;
         builds.push(build);
     }
 
+    let gates = derive_receipt_gates(
+        &fixture,
+        &builds,
+        fixture_binary_checksums_verified,
+        hybrid_control_reconstructed,
+        build_artifacts_verified,
+        options.query_repeats,
+    );
+    if !gates.all_passed() {
+        return Err(invalid(format!(
+            "derived receipt gates did not all pass: {gates:?}"
+        )));
+    }
     let summary = render_summary(&fixture, &hardware, &builds, &fast_hnsw_git_sha)?;
     write_atomic(&options.output_dir.join("summary.md"), summary.as_bytes())?;
     let fixture_sha256 = sha256_file(&options.fixture_dir.join("fixture.json"))?;
@@ -328,6 +396,7 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
         "model": fixture.model,
         "corpus": fixture.corpus,
         "query_fixture": fixture.query_fixture,
+        "oracle_checks": fixture.oracle_checks,
         "fixture": {
             "schema_version": fixture.schema_version,
             "metadata_file": "fixture/fixture.json",
@@ -346,6 +415,10 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
             "query_efs": EFS,
             "query_repeats": options.query_repeats,
             "warmup_queries": options.warmup,
+            "rss_definition": concat!(
+                "whole child-process VmHWM including fixture residency, graph construction, ",
+                "persistence, mmap validation, and mmap query page faults"
+            ),
             "hnsw": {
                 "m": M,
                 "m0": M0,
@@ -364,18 +437,7 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
         "queries": query_definitions,
         "shadow_sets": fixture.shadow_sets,
         "builds": builds,
-        "gates": {
-            "owned_semble_source_verified": true,
-            "model_and_dimension_verified": true,
-            "corpus_revision_and_cleanliness_verified": true,
-            "fixture_binary_checksums_verified": true,
-            "hybrid_control_reconstructed": true,
-            "all_worker_builds_persisted_and_mmap_opened": true,
-            "all_results_complete": true,
-            "accept_all_filter_matches_dense_hnsw": true,
-            "no_shadowed_file_emitted": true,
-            "rejected_nodes_observed_during_filtered_navigation": true,
-        },
+        "gates": gates,
     });
     let encoded = serde_json::to_vec_pretty(&receipt)?;
     write_atomic(&options.output_dir.join("receipt.json"), &encoded)?;
@@ -482,9 +544,9 @@ fn run_child(arguments: &[String]) -> AnyResult<()> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("artifact path has no UTF-8 filename"))?
         .to_owned();
-    let peak_rss_bytes = peak_rss_bytes()?;
-    if cfg!(target_os = "linux") && peak_rss_bytes.is_none() {
-        return Err(invalid("Linux child could not read VmHWM peak RSS"));
+    let child_peak_rss_bytes = child_peak_rss_bytes()?;
+    if cfg!(target_os = "linux") && child_peak_rss_bytes.is_none() {
+        return Err(invalid("Linux child could not read its VmHWM peak RSS"));
     }
 
     let receipt = BuildReceipt {
@@ -528,7 +590,7 @@ fn run_child(arguments: &[String]) -> AnyResult<()> {
             bytes: artifact_bytes,
             sha256: artifact_sha256,
         },
-        peak_rss_bytes,
+        child_peak_rss_bytes,
         graph,
         evaluations,
     };
@@ -598,78 +660,98 @@ fn evaluate_ef(
             shadow_mask[*id] = true;
         }
         let mut query_receipts = Vec::with_capacity(fixture.queries.len());
-        let mut latency_samples = Vec::with_capacity(fixture.queries.len());
+        let mut latency_samples = Vec::with_capacity(fixture.queries.len() * query_repeats);
+        let mut accepted_counts = Vec::with_capacity(fixture.queries.len());
         let mut rejected_total = 0usize;
-        let mut emitted = false;
+        let mut shadowed_file_emitted = false;
         for (query_index, (query, vector)) in fixture
             .queries
             .iter()
             .zip(query_vectors)
             .enumerate()
         {
-            let rejected = Cell::new(0usize);
             let mut workspace = SearchWorkspace::new(index.len(), ef);
-            let started = Instant::now();
-            let results = index.search_filtered_with_workspace(
-                vector,
-                candidate_count,
-                ef,
-                |id| {
-                    let accepted = !shadow_mask[id];
-                    if !accepted {
-                        rejected.set(rejected.get() + 1);
-                    }
-                    accepted
-                },
-                &mut workspace,
-            )?;
-            latency_samples.push(elapsed_us(started.elapsed()));
-            if results.len() != candidate_count {
-                return Err(invalid(format!(
-                    "query {} filtered result {} is incomplete",
-                    query.id, shadow.name
-                )));
+            for _ in 0..warmup {
+                let (warm_results, _) = search_filtered_once(
+                    index,
+                    vector,
+                    candidate_count,
+                    ef,
+                    &shadow_mask,
+                    &mut workspace,
+                )?;
+                let warm_ids: Vec<usize> =
+                    warm_results.iter().map(|result| result.id).collect();
+                shadowed_file_emitted |= warm_ids.iter().any(|id| shadow_mask[*id]);
+                validate_filtered_candidates(&warm_ids, &shadow_mask).map_err(|error| {
+                    invalid(format!(
+                        "query {} {} warmup failed: {error}",
+                        query.id, shadow.name
+                    ))
+                })?;
+                if shadow.file_count == 0 && warm_ids != dense_results[query_index] {
+                    return Err(invalid(format!(
+                        "query {} accept-all filtered warmup drifted from dense HNSW",
+                        query.id
+                    )));
+                }
             }
-            let candidate_ids: Vec<usize> = results.iter().map(|result| result.id).collect();
-            if shadow.file_count == 0 && candidate_ids != dense_results[query_index] {
-                return Err(invalid(format!(
-                    "query {} accept-all filtered traversal drifted from dense HNSW",
-                    query.id
-                )));
+
+            let mut samples = Vec::with_capacity(query_repeats);
+            let mut candidate_ids = Vec::new();
+            let mut rejected_observed = 0usize;
+            for _ in 0..query_repeats {
+                let started = Instant::now();
+                let (results, rejected) = search_filtered_once(
+                    index,
+                    vector,
+                    candidate_count,
+                    ef,
+                    &shadow_mask,
+                    &mut workspace,
+                )?;
+                samples.push(elapsed_us(started.elapsed()));
+                let ids: Vec<usize> = results.iter().map(|result| result.id).collect();
+                shadowed_file_emitted |= ids.iter().any(|id| shadow_mask[*id]);
+                validate_filtered_candidates(&ids, &shadow_mask).map_err(|error| {
+                    invalid(format!("query {} {} failed: {error}", query.id, shadow.name))
+                })?;
+                if shadow.file_count == 0 && ids != dense_results[query_index] {
+                    return Err(invalid(format!(
+                        "query {} accept-all filtered traversal drifted from dense HNSW",
+                        query.id
+                    )));
+                }
+                candidate_ids = ids;
+                rejected_observed = rejected;
             }
-            if candidate_ids.iter().any(|id| shadow_mask[*id]) {
-                emitted = true;
-            }
+            let accepted_returned = candidate_ids.len();
             let exact = query.filtered_exact.get(&shadow.name).ok_or_else(|| {
                 invalid(format!("query {} is missing {} control", query.id, shadow.name))
             })?;
             let exact_ids: Vec<usize> = exact.iter().map(|result| result.chunk_index).collect();
             let recall = recall_metrics(&candidate_ids, &exact_ids);
-            rejected_total += rejected.get();
+            latency_samples.extend_from_slice(&samples);
+            accepted_counts.push(accepted_returned);
+            rejected_total += rejected_observed;
             query_receipts.push(FilteredQueryReceipt {
                 query_id: query.id.clone(),
                 recall,
-                rejected_nodes_observed: rejected.get(),
+                accepted_returned,
+                latency_us: latency_summary(&samples),
+                rejected_nodes_observed: rejected_observed,
                 exact_top_10: exact_ids.into_iter().take(10).collect(),
                 hnsw_top_10: candidate_ids.into_iter().take(10).collect(),
             });
-        }
-        if emitted {
-            return Err(invalid(format!("HNSW emitted a file from {}", shadow.name)));
-        }
-        if shadow.file_count > 0 && rejected_total == 0 {
-            return Err(invalid(format!(
-                "{} did not observe rejected nodes during traversal",
-                shadow.name
-            )));
         }
         filtered.push(FilteredEvaluation {
             shadow_set: shadow.name.clone(),
             shadow_file_count: shadow.file_count,
             aggregate: mean_recall(query_receipts.iter().map(|query| query.recall)),
+            accepted_returned: returned_count_summary(&accepted_counts, candidate_count),
             latency_us: latency_summary(&latency_samples),
             rejected_nodes_observed: rejected_total,
-            shadowed_file_emitted: emitted,
+            shadowed_file_emitted,
             queries: query_receipts,
         });
     }
@@ -719,6 +801,31 @@ fn evaluate_ef(
         filtered,
         hybrid,
     })
+}
+
+fn search_filtered_once(
+    index: &Hnsw<Cosine>,
+    vector: &[f32],
+    candidate_count: usize,
+    ef: usize,
+    shadow_mask: &[bool],
+    workspace: &mut SearchWorkspace,
+) -> fast_hnsw::Result<(Vec<fast_hnsw::SearchResult>, usize)> {
+    let rejected = Cell::new(0usize);
+    let results = index.search_filtered_with_workspace(
+        vector,
+        candidate_count,
+        ef,
+        |id| {
+            let accepted = !shadow_mask[id];
+            if !accepted {
+                rejected.set(rejected.get() + 1);
+            }
+            accepted
+        },
+        workspace,
+    )?;
+    Ok((results, rejected.get()))
 }
 
 fn validate_build_receipt(
@@ -779,7 +886,15 @@ fn validate_build_receipt(
             || evaluation.filtered.iter().any(|scenario| {
                 scenario.shadowed_file_emitted
                     || scenario.queries.len() != fixture.queries.len()
-                    || (scenario.shadow_file_count > 0 && scenario.rejected_nodes_observed == 0)
+                    || scenario.accepted_returned.requested
+                        != fixture.ranking.candidate_count()
+                    || scenario.accepted_returned.min == 0
+                    || scenario.accepted_returned.max
+                        > fixture.ranking.candidate_count()
+                    || scenario
+                        .queries
+                        .iter()
+                        .any(|query| query.accepted_returned == 0)
             })
         {
             return Err(invalid(format!(
@@ -789,6 +904,148 @@ fn validate_build_receipt(
         }
     }
     Ok(())
+}
+
+fn derive_receipt_gates(
+    fixture: &Fixture,
+    builds: &[BuildReceipt],
+    fixture_binary_checksums_verified: bool,
+    hybrid_control_reconstructed: bool,
+    build_artifacts_verified: bool,
+    query_repeats: usize,
+) -> ReceiptGates {
+    let owned_semble_source_verified = fixture
+        .oracle_checks
+        .installed_semble_source_verified
+        && fixture.generator.semble_repository == EXPECTED_SEMBLE_REPOSITORY
+        && fixture.generator.semble_tag == EXPECTED_SEMBLE_TAG
+        && fixture.generator.semble_git_sha == EXPECTED_SEMBLE_SHA
+        && fixture.generator.semble_version == EXPECTED_SEMBLE_VERSION
+        && !fixture.generator.source_hashes.is_empty()
+        && fixture.generator.source_hashes.values().all(|hash| {
+            hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+        });
+    let model_and_dimension_verified = fixture.oracle_checks.model_identity_verified
+        && fixture.model.identifier == EXPECTED_MODEL
+        && fixture.model.dimension == EXPECTED_DIMENSION;
+    let corpus_revision_and_cleanliness_verified = fixture
+        .oracle_checks
+        .corpus_identity_verified
+        && fixture.corpus.repository == EXPECTED_CORPUS_REPOSITORY
+        && fixture.corpus.git_sha == EXPECTED_CORPUS_SHA
+        && fixture.corpus.clean;
+    let dense_control_exactness_verified = fixture.oracle_checks.dense_backend_verified
+        && fixture.oracle_checks.dense_backend
+            == "semble.index.dense.SelectableBasicBackend"
+        && fixture.oracle_checks.brute_force_query_id == "y01"
+        && fixture.oracle_checks.brute_force_top_k == fixture.ranking.candidate_count()
+        && fixture.oracle_checks.brute_force_top_k_set_equal
+        && fixture.oracle_checks.brute_force_top_1_equal
+        && fixture.oracle_checks.brute_force_scores_match;
+    let shadow_oracle_membership_verified = fixture
+        .oracle_checks
+        .shadow_membership_verified;
+
+    let all_worker_builds_persisted_and_mmap_opened = build_artifacts_verified
+        && builds.len() == WORKERS.len()
+        && builds.iter().zip(WORKERS).all(|(build, workers)| {
+            build.status == "complete"
+                && build.hnsw_ready
+                && build.config.workers == workers
+                && build.artifact.bytes > 0
+                && build.artifact.sha256.len() == 64
+                && build.graph.vectors == fixture.chunks.len()
+                && build.graph.dimension == EXPECTED_DIMENSION
+                && build.phase_timings_ms.persist.is_finite()
+                && build.phase_timings_ms.mmap_open.is_finite()
+                && build.phase_timings_ms.mmap_validation.is_finite()
+        });
+    let all_results_complete = builds
+        .iter()
+        .all(|build| build_results_complete(build, fixture, query_repeats));
+    let accept_all_filter_matches_dense_hnsw = builds.iter().all(|build| {
+        build.evaluations.iter().all(|evaluation| {
+            let Some(accept_all) = evaluation
+                .filtered
+                .iter()
+                .find(|scenario| scenario.shadow_file_count == 0)
+            else {
+                return false;
+            };
+            accept_all.queries.iter().zip(&evaluation.dense.queries).all(
+                |(filtered, dense)| {
+                    filtered.query_id == dense.query_id
+                        && filtered.accepted_returned == fixture.ranking.candidate_count()
+                        && filtered.hnsw_top_10 == dense.hnsw_top_10
+                },
+            )
+        })
+    });
+    let no_shadowed_file_emitted = builds.iter().all(|build| {
+        build.evaluations.iter().all(|evaluation| {
+            evaluation
+                .filtered
+                .iter()
+                .all(|scenario| !scenario.shadowed_file_emitted)
+        })
+    });
+    ReceiptGates {
+        owned_semble_source_verified,
+        model_and_dimension_verified,
+        corpus_revision_and_cleanliness_verified,
+        fixture_binary_checksums_verified,
+        dense_control_exactness_verified,
+        shadow_oracle_membership_verified,
+        hybrid_control_reconstructed,
+        all_worker_builds_persisted_and_mmap_opened,
+        all_results_complete,
+        accept_all_filter_matches_dense_hnsw,
+        no_shadowed_file_emitted,
+    }
+}
+
+fn build_results_complete(
+    build: &BuildReceipt,
+    fixture: &Fixture,
+    query_repeats: usize,
+) -> bool {
+    let query_count = fixture.queries.len();
+    let candidate_count = fixture.ranking.candidate_count();
+    build.evaluations.len() == EFS.len()
+        && build.evaluations.iter().zip(EFS).all(|(evaluation, ef)| {
+            evaluation.ef == ef
+                && evaluation.dense.queries.len() == query_count
+                && evaluation.dense.latency_us.samples == query_count * query_repeats
+                && evaluation.dense.queries.iter().all(|query| {
+                    query.latency_us.samples == query_repeats
+                        && query.exact_top_10.len() == 10
+                        && query.hnsw_top_10.len() == 10
+                })
+                && evaluation.filtered.len() == fixture.shadow_sets.len()
+                && evaluation.filtered.iter().all(|scenario| {
+                    let counts: Vec<usize> = scenario
+                        .queries
+                        .iter()
+                        .map(|query| query.accepted_returned)
+                        .collect();
+                    scenario.queries.len() == query_count
+                        && scenario.latency_us.samples == query_count * query_repeats
+                        && scenario.accepted_returned
+                            == returned_count_summary(&counts, candidate_count)
+                        && scenario.queries.iter().all(|query| {
+                            query.accepted_returned > 0
+                                && query.latency_us.samples == query_repeats
+                                && query.exact_top_10.len() == 10
+                                && query.hnsw_top_10.len()
+                                    == query.accepted_returned.min(10)
+                        })
+                })
+                && evaluation.hybrid.queries.len() == query_count
+                && evaluation.hybrid.queries.iter().all(|query| {
+                    query.control_top_10.len() == fixture.ranking.top_k
+                        && query.candidate_top_10.len() == fixture.ranking.top_k
+                })
+        })
 }
 
 fn render_summary(
@@ -855,7 +1112,7 @@ fn render_summary(
     writeln!(output)?;
     writeln!(
         output,
-        "| workers | mode | build ms | persist ms | mmap ms | verify ms | artifact | peak RSS | ready |"
+        "| workers | mode | build ms | persist ms | mmap ms | verify ms | artifact | child peak RSS | ready |"
     )?;
     writeln!(output, "|---:|---|---:|---:|---:|---:|---:|---:|:---:|")?;
     for build in builds {
@@ -869,7 +1126,7 @@ fn render_summary(
             build.phase_timings_ms.mmap_open,
             build.phase_timings_ms.mmap_validation,
             format_bytes(Some(build.artifact.bytes)),
-            format_bytes(build.peak_rss_bytes),
+            format_bytes(build.child_peak_rss_bytes),
         )?;
     }
     writeln!(output)?;
@@ -893,11 +1150,11 @@ fn render_summary(
         "| workers | ef | dense R@1 | R@5 | R@10 | dense p50 us | \
          Semble target R@10 | HNSW target R@10 | Semble MRR@10 | HNSW MRR@10 | \
          Semble agreement R@10 | \
-         shadow-10 R@10 | shadow-50 R@10 |"
+         shadow-10 R@10 | shadow-10 min n | shadow-50 R@10 | shadow-50 min n |"
     )?;
     writeln!(
         output,
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )?;
     for build in builds {
         for evaluation in &build.evaluations {
@@ -906,7 +1163,7 @@ fn render_summary(
             writeln!(
                 output,
                 "| {} | {} | {:.4} | {:.4} | {:.4} | {:.1} | {:.4} | {:.4} | \
-                 {:.4} | {:.4} | {:.4} | {:.4} | {:.4} |",
+                 {:.4} | {:.4} | {:.4} | {:.4} | {} | {:.4} | {} |",
                 build.config.workers,
                 evaluation.ef,
                 evaluation.dense.aggregate.recall_at_1,
@@ -919,7 +1176,9 @@ fn render_summary(
                 evaluation.hybrid.candidate_target.mrr_at_10,
                 evaluation.hybrid.control_agreement.recall_at_10,
                 shadow_10.aggregate.recall_at_10,
+                shadow_10.accepted_returned.min,
                 shadow_50.aggregate.recall_at_10,
+                shadow_50.accepted_returned.min,
             )?;
         }
     }
@@ -934,8 +1193,20 @@ fn render_summary(
     )?;
     writeln!(
         output,
+        "Filtered latency uses the same warmup and timed repetition counts as dense \
+         latency. Returned-count evidence remains explicit when filtering finds fewer \
+         than the requested 50 eligible candidates."
+    )?;
+    writeln!(
+        output,
+        "Child peak RSS is Linux `VmHWM` for the entire isolated child, including \
+         fixture residency, graph construction, persistence, mmap validation, and \
+         mmap query page faults; it is not construction-only RSS."
+    )?;
+    writeln!(
+        output,
         "Filtered searches use deterministic nested 0-, 10-, and 50-file exclusions. \
-         Rejected nodes were observed during traversal, and no excluded file was emitted."
+         Rejected-node predicate observations are recorded, and no excluded file was emitted."
     )?;
     Ok(output)
 }
@@ -1068,7 +1339,7 @@ fn linux_pretty_name() -> io::Result<Option<String>> {
     }))
 }
 
-fn peak_rss_bytes() -> io::Result<Option<u64>> {
+fn child_peak_rss_bytes() -> io::Result<Option<u64>> {
     let Ok(contents) = fs::read_to_string("/proc/self/status") else {
         return Ok(None);
     };
@@ -1200,4 +1471,29 @@ fn elapsed_us(duration: Duration) -> f64 {
 
 fn invalid(message: impl Into<String>) -> AnyError {
     Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReceiptGates;
+
+    #[test]
+    fn receipt_gate_aggregate_tracks_each_outcome() {
+        let mut gates = ReceiptGates {
+            owned_semble_source_verified: true,
+            model_and_dimension_verified: true,
+            corpus_revision_and_cleanliness_verified: true,
+            fixture_binary_checksums_verified: true,
+            dense_control_exactness_verified: true,
+            shadow_oracle_membership_verified: true,
+            hybrid_control_reconstructed: true,
+            all_worker_builds_persisted_and_mmap_opened: true,
+            all_results_complete: true,
+            accept_all_filter_matches_dense_hnsw: true,
+            no_shadowed_file_emitted: true,
+        };
+        assert!(gates.all_passed());
+        gates.shadow_oracle_membership_verified = false;
+        assert!(!gates.all_passed());
+    }
 }

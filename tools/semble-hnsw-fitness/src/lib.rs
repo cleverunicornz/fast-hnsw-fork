@@ -6,8 +6,8 @@ use std::path::{Component, Path};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const FIXTURE_SCHEMA_VERSION: u32 = 1;
-pub const RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const FIXTURE_SCHEMA_VERSION: u32 = 2;
+pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
 pub const EXPECTED_SEMBLE_VERSION: &str = "0.7.0";
 pub const EXPECTED_SEMBLE_REPOSITORY: &str = "cleverunicornz/semble";
 pub const EXPECTED_SEMBLE_TAG: &str = "v0.7.0";
@@ -26,6 +26,7 @@ pub struct Fixture {
     pub model: ModelIdentity,
     pub corpus: CorpusIdentity,
     pub query_fixture: QueryFixtureIdentity,
+    pub oracle_checks: OracleChecks,
     pub controls: ControlDefinitions,
     pub ranking: RankingRecipe,
     pub vectors: MatrixFile,
@@ -75,6 +76,34 @@ pub struct QueryFixtureIdentity {
     pub file: String,
     pub sha256: String,
     pub query_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OracleChecks {
+    pub installed_semble_source_verified: bool,
+    pub model_identity_verified: bool,
+    pub corpus_identity_verified: bool,
+    pub dense_backend: String,
+    pub dense_backend_verified: bool,
+    pub brute_force_query_id: String,
+    pub brute_force_top_k: usize,
+    pub brute_force_top_k_set_equal: bool,
+    pub brute_force_top_1_equal: bool,
+    pub brute_force_scores_match: bool,
+    pub shadow_membership_verified: bool,
+}
+
+impl OracleChecks {
+    pub fn all_passed(&self) -> bool {
+        self.installed_semble_source_verified
+            && self.model_identity_verified
+            && self.corpus_identity_verified
+            && self.dense_backend_verified
+            && self.brute_force_top_k_set_equal
+            && self.brute_force_top_1_equal
+            && self.brute_force_scores_match
+            && self.shadow_membership_verified
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -193,6 +222,16 @@ pub struct ControlAgreement {
     pub control_top1_mrr_at_10: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ReturnedCountSummary {
+    pub requested: usize,
+    pub min: usize,
+    pub p50: usize,
+    pub mean: f64,
+    pub max: usize,
+    pub short_queries: usize,
+}
+
 pub fn load_fixture(fixture_dir: &Path) -> Result<LoadedFixture, Box<dyn std::error::Error>> {
     let raw = fs::read(fixture_dir.join("fixture.json"))?;
     let fixture: Fixture = serde_json::from_slice(&raw)?;
@@ -260,6 +299,17 @@ pub fn validate_fixture(fixture: &Fixture) -> io::Result<()> {
     require(
         fixture.query_fixture.query_count == 36 && fixture.queries.len() == 36,
         "fixture must contain all 36 authoritative queries",
+    )?;
+    require(
+        fixture.oracle_checks.all_passed(),
+        "fixture oracle evidence contains a failed check",
+    )?;
+    require(
+        fixture.oracle_checks.dense_backend
+            == "semble.index.dense.SelectableBasicBackend"
+            && fixture.oracle_checks.brute_force_query_id == "y01"
+            && fixture.oracle_checks.brute_force_top_k == 50,
+        "fixture dense exactness evidence drifted",
     )?;
     require(
         fixture.corpus.chunk_count == fixture.chunks.len(),
@@ -551,6 +601,47 @@ pub fn recall_at(candidate: &[usize], exact: &[usize], k: usize) -> f64 {
         .filter(|id| exact.contains(id))
         .count();
     matches as f64 / denominator as f64
+}
+
+pub fn returned_count_summary(counts: &[usize], requested: usize) -> ReturnedCountSummary {
+    if counts.is_empty() {
+        return ReturnedCountSummary {
+            requested,
+            ..ReturnedCountSummary::default()
+        };
+    }
+    let mut sorted = counts.to_vec();
+    sorted.sort_unstable();
+    ReturnedCountSummary {
+        requested,
+        min: sorted[0],
+        p50: sorted[(sorted.len() - 1) / 2],
+        mean: sorted.iter().sum::<usize>() as f64 / sorted.len() as f64,
+        max: *sorted.last().expect("nonempty returned counts"),
+        short_queries: sorted.iter().filter(|count| **count < requested).count(),
+    }
+}
+
+pub fn validate_filtered_candidates(
+    candidate: &[usize],
+    excluded: &[bool],
+) -> Result<usize, String> {
+    if candidate.is_empty() {
+        return Err("filtered HNSW returned zero eligible candidates".into());
+    }
+    let mut seen = HashSet::new();
+    for id in candidate {
+        if *id >= excluded.len() {
+            return Err(format!("filtered HNSW returned out-of-range id {id}"));
+        }
+        if excluded[*id] {
+            return Err(format!("filtered HNSW emitted excluded id {id}"));
+        }
+        if !seen.insert(*id) {
+            return Err(format!("filtered HNSW returned duplicate id {id}"));
+        }
+    }
+    Ok(candidate.len())
 }
 
 pub fn target_metrics(
@@ -860,6 +951,40 @@ mod tests {
     }
 
     #[test]
+    fn recall_keeps_exact_denominator_when_candidate_is_short() {
+        let exact = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let candidate = [1, 2];
+        assert_eq!(recall_at(&candidate, &exact, 10), 2.0 / 10.0);
+    }
+
+    #[test]
+    fn filtered_candidate_validation_accepts_short_nonempty_results() {
+        let excluded = [false, false, false, true];
+        assert_eq!(validate_filtered_candidates(&[0, 2], &excluded), Ok(2));
+        assert!(validate_filtered_candidates(&[], &excluded).is_err());
+        assert!(validate_filtered_candidates(&[0, 3], &excluded).is_err());
+    }
+
+    #[test]
+    fn returned_count_summary_exposes_short_queries() {
+        let summary = returned_count_summary(&[50, 7, 20, 50], 50);
+        assert_eq!(summary.requested, 50);
+        assert_eq!(summary.min, 7);
+        assert_eq!(summary.p50, 20);
+        assert_eq!(summary.max, 50);
+        assert_eq!(summary.short_queries, 2);
+        assert_eq!(summary.mean, 31.75);
+    }
+
+    #[test]
+    fn oracle_checks_only_pass_when_every_proof_passes() {
+        let mut checks = sample_oracle_checks();
+        assert!(checks.all_passed());
+        checks.brute_force_scores_match = false;
+        assert!(!checks.all_passed());
+    }
+
+    #[test]
     fn filtered_search_traverses_rejected_nodes_but_never_emits_them() {
         let mut index = Builder::new()
             .m(16)
@@ -969,6 +1094,7 @@ mod tests {
                 sha256: EXPECTED_QUERY_FIXTURE_SHA256.into(),
                 query_count: 1,
             },
+            oracle_checks: sample_oracle_checks(),
             controls: ControlDefinitions {
                 dense_control: "exact".into(),
                 dense_candidate: "hnsw".into(),
@@ -1029,6 +1155,22 @@ mod tests {
             shadow_sets: Vec::new(),
             timings_ms: BTreeMap::new(),
             environment: BTreeMap::new(),
+        }
+    }
+
+    fn sample_oracle_checks() -> OracleChecks {
+        OracleChecks {
+            installed_semble_source_verified: true,
+            model_identity_verified: true,
+            corpus_identity_verified: true,
+            dense_backend: "semble.index.dense.SelectableBasicBackend".into(),
+            dense_backend_verified: true,
+            brute_force_query_id: "y01".into(),
+            brute_force_top_k: 50,
+            brute_force_top_k_set_equal: true,
+            brute_force_top_1_equal: true,
+            brute_force_scores_match: true,
+            shadow_membership_verified: true,
         }
     }
 }

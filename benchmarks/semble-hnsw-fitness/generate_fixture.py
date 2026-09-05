@@ -26,7 +26,7 @@ from typing import Any, Callable, TypeVar
 
 import numpy as np
 
-FIXTURE_SCHEMA_VERSION = 1
+FIXTURE_SCHEMA_VERSION = 2
 SEMBLE_REPOSITORY = "cleverunicornz/semble"
 SEMBLE_TAG = "v0.7.0"
 SEMBLE_GIT_SHA = "444a8bde49a9656856ac457d17b2b8ddbe0cd074"
@@ -115,22 +115,24 @@ def git(corpus: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def verify_installed_semble() -> Path:
+def verify_installed_semble() -> dict[str, str]:
     spec = importlib.util.find_spec("semble")
     if spec is None or not spec.submodule_search_locations:
         fail("the runner's pinned Semble package is not installed")
     package_root = Path(next(iter(spec.submodule_search_locations))).resolve()
+    observed: dict[str, str] = {}
     for relative, expected in SEMBLE_SOURCE_HASHES.items():
         source = package_root / relative
         if not source.is_file():
             fail(f"installed Semble source is missing {relative}")
         actual = sha256_bytes(source.read_bytes())
+        observed[relative] = actual
         if actual != expected:
             fail(
                 f"installed Semble source drift for {relative}: "
                 f"expected {expected}, found {actual}"
             )
-    return package_root
+    return observed
 
 
 def verify_queries(path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -205,6 +207,50 @@ def matrix_bytes(matrix: np.ndarray, expected_columns: int) -> bytes:
     if np.any(norms <= 0) or not np.isfinite(norms).all():
         fail("matrix contains a zero or invalid vector")
     return array.astype("<f4", copy=False).tobytes(order="C")
+
+
+def verify_direct_cosine_parity(
+    corpus_bytes: bytes,
+    query_bytes: bytes,
+    recorded: list[Any],
+    chunk_to_index: dict[Any, int],
+) -> dict[str, Any]:
+    vectors = np.frombuffer(corpus_bytes, dtype="<f4").reshape(-1, MODEL_DIMENSION)
+    queries = np.frombuffer(query_bytes, dtype="<f4").reshape(-1, MODEL_DIMENSION)
+    query = queries[0]
+    vector_norms = np.linalg.norm(vectors, axis=1)
+    query_norm = np.linalg.norm(query)
+    if np.any(vector_norms <= 0) or not np.isfinite(vector_norms).all() or query_norm <= 0:
+        fail("direct cosine parity encountered an invalid exported vector norm")
+    similarities = vectors.dot(query) / (vector_norms * query_norm)
+    direct_indices = np.argsort(-similarities, kind="stable")[:CANDIDATE_COUNT]
+    recorded_indices = np.array(
+        [chunk_to_index[result.chunk] for result in recorded],
+        dtype=np.int64,
+    )
+    top_k_set_equal = set(map(int, direct_indices)) == set(map(int, recorded_indices))
+    top_1_equal = int(direct_indices[0]) == int(recorded_indices[0])
+    scores_match = all(
+        np.isclose(
+            float(result.score),
+            float(similarities[chunk_to_index[result.chunk]]),
+            rtol=2e-5,
+            atol=2e-5,
+        )
+        for result in recorded
+    )
+    if not top_k_set_equal or not top_1_equal or not scores_match:
+        fail(
+            "Semble exact dense control did not match direct brute-force cosine "
+            "over the exported vectors for y01"
+        )
+    return {
+        "brute_force_query_id": "y01",
+        "brute_force_top_k": CANDIDATE_COUNT,
+        "brute_force_top_k_set_equal": top_k_set_equal,
+        "brute_force_top_1_equal": top_1_equal,
+        "brute_force_scores_match": scores_match,
+    }
 
 
 def ranked_hits(results: list[Any], chunk_to_index: dict[Any, int]) -> list[dict[str, Any]]:
@@ -282,10 +328,10 @@ def main() -> None:
         fail("HF_HUB_OFFLINE must be 1 so the pinned runner model cannot be replaced")
 
     total_started = time.perf_counter_ns()
-    verify_installed_semble()
+    observed_source_hashes = verify_installed_semble()
 
     from semble.index.create import create_index_from_path
-    from semble.index.dense import load_model
+    from semble.index.dense import SelectableBasicBackend, load_model
     from semble.index.index import SembleIndex
     from semble.ranking.boosting import _FILE_COHERENCE_BOOST_FRAC, apply_query_boost
     from semble.ranking.penalties import (
@@ -334,6 +380,13 @@ def main() -> None:
         )
 
     (bm25_index, semantic_index, chunks, manifest), semble_index_us = timed(create_index)
+    dense_backend = f"{type(semantic_index).__module__}.{type(semantic_index).__qualname__}"
+    dense_backend_verified = type(semantic_index) is SelectableBasicBackend
+    if not dense_backend_verified:
+        fail(
+            "Semble dense oracle must be semble.index.dense.SelectableBasicBackend; "
+            f"found {dense_backend}"
+        )
     index = SembleIndex(
         model,
         bm25_index,
@@ -483,16 +536,31 @@ def main() -> None:
             }
         )
 
+    shadow_exclusions: dict[str, Any] = {}
+    shadow_membership_verified = True
+    for shadow in shadow_sets:
+        oracle_excluded = index.indices_for_paths(set(shadow["files"]))
+        oracle_indices = (
+            []
+            if oracle_excluded is None
+            else [int(index) for index in oracle_excluded.tolist()]
+        )
+        serialized_indices = [int(index) for index in shadow["chunk_indices"]]
+        membership_equal = oracle_indices == serialized_indices
+        shadow_membership_verified = shadow_membership_verified and membership_equal
+        if not membership_equal:
+            fail(
+                f"Semble indices_for_paths disagrees with serialized membership for "
+                f"{shadow['name']}"
+            )
+        shadow_exclusions[shadow["name"]] = oracle_excluded
+
     query_metadata = []
     for query_index, draft in enumerate(drafts):
         filtered_exact: dict[str, list[dict[str, Any]]] = {}
         filtered_total_us = 0.0
         for shadow in shadow_sets:
-            excluded = (
-                index.indices_for_paths(set(shadow["files"]))
-                if shadow["files"]
-                else None
-            )
+            excluded = shadow_exclusions[shadow["name"]]
             results, elapsed_us = timed(
                 lambda draft=draft, excluded=excluded: _search_semantic_prepared(
                     draft.prepared.embedding,
@@ -536,6 +604,14 @@ def main() -> None:
     corpus_bytes = matrix_bytes(corpus_vectors, MODEL_DIMENSION)
     query_matrix = np.vstack(query_vector_rows)
     query_bytes = matrix_bytes(query_matrix, MODEL_DIMENSION)
+    direct_cosine_checks, direct_cosine_us = timed(
+        lambda: verify_direct_cosine_parity(
+            corpus_bytes,
+            query_bytes,
+            drafts[0].exact_dense,
+            chunk_to_index,
+        )
+    )
     probe = np.asarray(
         model.encode(
             [
@@ -585,6 +661,21 @@ def main() -> None:
             "sha256": query_digest,
             "query_count": len(query_definitions),
         },
+        "oracle_checks": {
+            "installed_semble_source_verified": (
+                observed_source_hashes == SEMBLE_SOURCE_HASHES
+            ),
+            "model_identity_verified": (
+                resolved_model == MODEL_IDENTIFIER and int(model.dim) == MODEL_DIMENSION
+            ),
+            "corpus_identity_verified": (
+                corpus_identity["git_sha"] == CORPUS_GIT_SHA and corpus_identity["clean"]
+            ),
+            "dense_backend": dense_backend,
+            "dense_backend_verified": dense_backend_verified,
+            **direct_cosine_checks,
+            "shadow_membership_verified": shadow_membership_verified,
+        },
         "controls": {
             "dense_control": "Semble 0.7.0 exact cosine top-50 over its baseline chunk vectors; BM25 disabled",
             "dense_candidate": "fast-hnsw 2.0 cosine HNSW top-50 over the identical baseline vectors; BM25 disabled",
@@ -632,6 +723,7 @@ def main() -> None:
             "corpus_identity": corpus_hash_us / 1_000.0,
             "model_load": model_load_us / 1_000.0,
             "semble_index_build": semble_index_us / 1_000.0,
+            "direct_cosine_parity": direct_cosine_us / 1_000.0,
             "fixture_generation_total": total_ms,
         },
         "environment": {

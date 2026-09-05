@@ -6,8 +6,8 @@ change Semble's embedding model, or add Semble-specific types to the
 
 ## Pinned inputs
 
-- Semble: `cleverunicornz/semble@v0.7.0`, peeled commit
-  `444a8bde49a9656856ac457d17b2b8ddbe0cd074`.
+- Semble: `cleverunicornz/semble@v0.7.1`, peeled commit
+  `21d885145c8724b94122fa0718988b0c7bf8e902`.
 - Model: `minishlab/potion-code-16M-v2`, 256 dimensions.
 - Corpus: `cleverunicornz/yeet-code` commit
   `951dd74fd6cdbe050cb451dc9ab0448836728dbb`.
@@ -20,7 +20,7 @@ change Semble's embedding model, or add Semble-specific types to the
 `generate_fixture.py` uses the runner's installed Semble. Before importing its
 benchmark behavior, it hashes the installed source files that define indexing,
 exact dense retrieval, exclusions, RRF, boosting, and reranking. Every hash must
-match the owned release above. A package that merely reports version `0.7.0`
+match the owned release above. A package that merely reports version `0.7.1`
 but contains different code is rejected.
 
 The `cvu-agent-code-x64` image is intentionally required to pre-provision that
@@ -101,7 +101,7 @@ independently sampled phases and label the result as direct end-to-end latency.
 
 ## Local validation
 
-Run from the `fast-hnsw-fork` root with the owned Semble 0.7.0 environment
+Run from the `fast-hnsw-fork` root with the owned Semble 0.7.1 environment
 already active:
 
 ```bash

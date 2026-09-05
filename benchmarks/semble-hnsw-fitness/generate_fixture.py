@@ -3,7 +3,7 @@
 
 This script intentionally runs against the runner's installed Semble. It
 refuses any package whose behavior-bearing source files do not match the owned
-v0.7.0 release, then records the exact vectors and control-stage results used
+v0.7.1 release, then records the exact vectors and control-stage results used
 by the Rust benchmark support binary.
 """
 
@@ -29,9 +29,9 @@ import numpy as np
 
 FIXTURE_SCHEMA_VERSION = 2
 SEMBLE_REPOSITORY = "cleverunicornz/semble"
-SEMBLE_TAG = "v0.7.0"
-SEMBLE_GIT_SHA = "444a8bde49a9656856ac457d17b2b8ddbe0cd074"
-SEMBLE_VERSION = "0.7.0"
+SEMBLE_TAG = "v0.7.1"
+SEMBLE_GIT_SHA = "21d885145c8724b94122fa0718988b0c7bf8e902"
+SEMBLE_VERSION = "0.7.1"
 MODEL_IDENTIFIER = "minishlab/potion-code-16M-v2"
 MODEL_DIMENSION = 256
 CORPUS_REPOSITORY = "cleverunicornz/yeet-code"
@@ -45,7 +45,7 @@ DIRECT_COSINE_SCORE_TOLERANCE = 5e-4
 CANDIDATE_COUNT = TOP_K * CANDIDATE_MULTIPLIER
 
 # These hashes bind every behavior-bearing installed module used by the
-# benchmark to cleverunicornz/semble@v0.7.0. Runtime and distribution versions
+# benchmark to cleverunicornz/semble@v0.7.1. Runtime and distribution versions
 # are enforced separately because packaged version.py generation may differ.
 SEMBLE_SOURCE_HASHES = {
     "index/dense.py": "cadaecf677186892665765a772b873580ff3fda8b8519b1ca76f4f665460f460",
@@ -734,14 +734,14 @@ def main() -> None:
             "shadow_membership_verified": shadow_membership_verified,
         },
         "controls": {
-            "dense_control": "Semble 0.7.0 exact cosine top-50 over its baseline chunk vectors; BM25 disabled",
+            "dense_control": "Semble 0.7.1 exact cosine top-50 over its baseline chunk vectors; BM25 disabled",
             "dense_candidate": "fast-hnsw 2.0 cosine HNSW top-50 over the identical baseline vectors; BM25 disabled",
             "hybrid_control": (
-                "Semble 0.7.0 exact dense plus its BM25, weighted RRF, query boosts, "
+                "Semble 0.7.1 exact dense plus its BM25, weighted RRF, query boosts, "
                 "path penalties, and file saturation"
             ),
             "hybrid_candidate": (
-                "fast-hnsw baseline dense plus the same recorded Semble 0.7.0 BM25 "
+                "fast-hnsw baseline dense plus the same recorded Semble 0.7.1 BM25 "
                 "and reconstructed ranking stages"
             ),
             "delta_scope": (

@@ -15,7 +15,7 @@ jobs:
     name: cvu-agent-code-x64
     runs-on: cvu-agent-code-x64
     timeout-minutes: 240
-    # Image contract: Semble 0.7.0 and the model snapshot are pre-provisioned.
+    # Image contract: Semble 0.7.1 and the model snapshot are pre-provisioned.
     # The generator verifies both; this workflow intentionally installs neither.
     env:
       CORPUS_SHA: 951dd74fd6cdbe050cb451dc9ab0448836728dbb

@@ -8,10 +8,10 @@ use sha2::{Digest, Sha256};
 
 pub const FIXTURE_SCHEMA_VERSION: u32 = 2;
 pub const RECEIPT_SCHEMA_VERSION: u32 = 2;
-pub const EXPECTED_SEMBLE_VERSION: &str = "0.7.0";
+pub const EXPECTED_SEMBLE_VERSION: &str = "0.7.1";
 pub const EXPECTED_SEMBLE_REPOSITORY: &str = "cleverunicornz/semble";
-pub const EXPECTED_SEMBLE_TAG: &str = "v0.7.0";
-pub const EXPECTED_SEMBLE_SHA: &str = "444a8bde49a9656856ac457d17b2b8ddbe0cd074";
+pub const EXPECTED_SEMBLE_TAG: &str = "v0.7.1";
+pub const EXPECTED_SEMBLE_SHA: &str = "21d885145c8724b94122fa0718988b0c7bf8e902";
 pub const EXPECTED_MODEL: &str = "minishlab/potion-code-16M-v2";
 pub const EXPECTED_DIMENSION: usize = 256;
 pub const EXPECTED_CORPUS_REPOSITORY: &str = "cleverunicornz/yeet-code";

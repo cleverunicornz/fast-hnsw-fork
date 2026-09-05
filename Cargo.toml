@@ -14,7 +14,8 @@ exclude = [
 ]
 
 [workspace]
-members = ["quantized"]
+members = ["quantized", "tools/semble-hnsw-fitness"]
+default-members = [".", "quantized"]
 resolver = "2"
 
 [features]

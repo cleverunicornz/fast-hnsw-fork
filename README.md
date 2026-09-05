@@ -628,6 +628,12 @@ The vector section (`n × dim × 4 bytes = 25.6 MiB`) dominates in all cases.  T
 
 ## Running the benchmarks
 
+The production-corpus Semble comparison is an isolated support binary with a
+separately generated, version-gated fixture. See the
+[Semble / HNSW fitness benchmark](benchmarks/semble-hnsw-fitness/README.md)
+for its exact corpus, controls, metrics, and manual workflow. It does not alter
+the library API or Semble's production search path.
+
 ```bash
 cargo build --release
 

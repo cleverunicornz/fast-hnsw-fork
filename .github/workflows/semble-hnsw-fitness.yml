@@ -71,7 +71,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 benchmarks/semble-hnsw-fitness/generate_fixture.py \
+          "$HOME/.local/share/semble/current/venv/bin/python" \
+            benchmarks/semble-hnsw-fitness/generate_fixture.py \
             --corpus benchmark-corpus \
             --queries benchmarks/semble-hnsw-fitness/queries.json \
             --output-dir benchmark-artifacts/fixture

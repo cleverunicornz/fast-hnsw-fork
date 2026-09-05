@@ -14,22 +14,22 @@ fn main() {
     // ── Example 1: 2-D Euclidean ────────────────────────────────────────
     println!("▶  Example 1 — 2-D Euclidean nearest neighbours");
     {
-        let mut index: Hnsw<Euclidean> = Builder::new().m(4).ef_construction(20).seed(0).build(Euclidean);
+        let mut index: Hnsw<Euclidean> = Builder::new().m(4).ef_construction(20).seed(0).build(Euclidean).unwrap();
 
         // Insert a 10×10 grid.
         for x in 0..10_u32 {
             for y in 0..10_u32 {
-                index.insert(vec![x as f32, y as f32]);
+                index.insert(vec![x as f32, y as f32]).unwrap();
             }
         }
 
         let query = [4.6f32, 6.2];
-        let results = index.search(&query, 5, 50);
+        let results = index.search(&query, 5, 50).unwrap();
         println!("   Index contains {} vectors (10×10 grid)", index.len());
         println!("   Query: {:?}", query);
         println!("   Top-5 nearest (id, dist):");
         for r in &results {
-            let v = index.get_vector(r.id);
+            let v = index.get_vector(r.id).unwrap();
             println!("     id={:>3}  vec={:>6?}  dist={:.4}", r.id, v, r.distance);
         }
         println!();
@@ -48,14 +48,14 @@ fn main() {
             ("kitten", [0.0,  0.95, 0.05, 0.0]),
         ];
 
-        let mut index: Hnsw<Cosine> = Builder::new().seed(1).build(Cosine);
+        let mut index: Hnsw<Cosine> = Builder::new().seed(1).build(Cosine).unwrap();
         for (_, v) in words {
-            index.insert(v.to_vec());
+            index.insert(v.to_vec()).unwrap();
         }
 
         let query = &[0.0f32, 0.88, 0.12, 0.0]; // close to "cat"/"dog"
         println!("   Query vector: {:?}", query);
-        let results = index.search(query, 3, 20);
+        let results = index.search(query, 3, 20).unwrap();
         println!("   Top-3 by cosine similarity:");
         for r in &results {
             println!(
@@ -71,11 +71,11 @@ fn main() {
     {
         use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::SmallRng::seed_from_u64(99);
-        let mut index: Hnsw<Euclidean> = Builder::new().m(16).ef_construction(200).seed(7).build(Euclidean);
+        let mut index: Hnsw<Euclidean> = Builder::new().m(16).ef_construction(200).seed(7).build(Euclidean).unwrap();
 
         for _ in 0..2_000 {
             let v: Vec<f32> = (0..64).map(|_| rng.random::<f32>()).collect();
-            index.insert(v);
+            index.insert(v).unwrap();
         }
 
         println!("{}", index.stats());

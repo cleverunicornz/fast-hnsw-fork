@@ -21,16 +21,17 @@
 //!
 //! let mut idx: LabeledIndex<Euclidean, u32> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
-//! );
+//! )?;
 //!
-//! idx.insert(vec![1.0, 0.0], 0_u32);   // class 0
-//! idx.insert(vec![0.0, 1.0], 1_u32);   // class 1
-//! idx.insert(vec![0.8, 0.2], 0_u32);   // class 0
+//! idx.insert(vec![1.0, 0.0], 0_u32).unwrap();   // class 0
+//! idx.insert(vec![0.0, 1.0], 1_u32).unwrap();   // class 1
+//! idx.insert(vec![0.8, 0.2], 0_u32).unwrap();   // class 0
 //!
-//! let results = idx.search(&[0.9, 0.1], 2, 20);
+//! let results = idx.search(&[0.9, 0.1], 2, 20).unwrap();
 //! for r in &results {
 //!     println!("id={} dist={:.3} class={}", r.id, r.distance, r.payload);
 //! }
+//! # Ok::<(), fast_hnsw::Error>(())
 //! ```
 //!
 //! # Example — text label + save/load
@@ -41,25 +42,28 @@
 //!
 //! let mut idx: LabeledIndex<Euclidean, String> = LabeledIndex::new(
 //!     Default::default(), Euclidean,
-//! );
-//! idx.insert(vec![1.0, 0.0], "cat".to_string());
-//! idx.insert(vec![0.0, 1.0], "dog".to_string());
+//! )?;
+//! idx.insert(vec![1.0, 0.0], "cat".to_string()).unwrap();
+//! idx.insert(vec![0.0, 1.0], "dog".to_string()).unwrap();
 //!
 //! idx.save("animals.hnsw").unwrap();
 //!
 //! let loaded = LabeledIndex::<Euclidean, String>::load("animals.hnsw", Euclidean).unwrap();
-//! let hits = loaded.search(&[0.9, 0.1], 1, 10);
+//! let hits = loaded.search(&[0.9, 0.1], 1, 10).unwrap();
 //! println!("nearest: {}", hits[0].payload);  // "cat"
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use std::io;
 use std::path::Path;
+use std::cell::RefCell;
 
 use crate::Builder;
 use crate::distance::Distance;
-use crate::hnsw::{Config, Hnsw};
+use crate::error::Result;
+use crate::hnsw::{Config, Hnsw, SearchResult, SearchWorkspace};
 use crate::payload::Payload;
-use crate::persist;
+use crate::persist::{self, MappedPayloads};
 
 // ─── Result type ─────────────────────────────────────────────────────────────
 
@@ -72,6 +76,17 @@ pub struct LabeledResult<'a, L> {
     /// Reference to the payload associated with this vector.
     pub payload:   &'a L,
     /// The stored vector (borrowed from the index).
+    pub embedding: &'a [f32],
+}
+
+/// One result from a [`MappedLabeledIndex`] search.
+///
+/// Fixed-width payloads are decoded from the mmap into the owned `payload`
+/// field; vectors remain borrowed from the mapping.
+pub struct MappedLabeledResult<'a, L> {
+    pub id: usize,
+    pub distance: f32,
+    pub payload: L,
     pub embedding: &'a [f32],
 }
 
@@ -95,12 +110,10 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     /// Create a new, empty labeled index.
     ///
     /// For ergonomic construction with method chaining, use
-    /// [`Builder::build_labeled`](LabeledBuilder).
-    pub fn new(config: Config, metric: D) -> Self {
-        Self {
-            payloads: Vec::with_capacity(config.capacity),
-            inner:    Hnsw::new(config, metric),
-        }
+    /// [`Builder::build_labeled`].
+    pub fn new(config: Config, metric: D) -> Result<Self> {
+        let payloads = Vec::with_capacity(config.capacity);
+        Ok(Self { inner: Hnsw::new(config, metric)?, payloads })
     }
 
     /// Build from an existing [`Builder`].
@@ -113,10 +126,12 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///     .m(16)
     ///     .ef_construction(200)
     ///     .capacity(10_000)
-    ///     .build_labeled(Euclidean);
+    ///     .build_labeled(Euclidean).unwrap();
     /// ```
-    pub fn from_builder(builder: Builder, metric: D) -> Self {
-        Self::new(builder.into_config(), metric)
+    pub fn from_builder(builder: Builder, metric: D) -> Result<Self> {
+        let inner = builder.build(metric)?;
+        let payloads = Vec::with_capacity(inner.config().capacity);
+        Ok(Self { inner, payloads })
     }
 
     // ─── Mutation ─────────────────────────────────────────────────────────
@@ -125,16 +140,16 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///
     /// Returns the zero-based id assigned to this vector (same as `self.len()
     /// - 1` after the call).  Both the vector and the payload are stored
-    /// internally and retrievable by id.
+    ///   internally and retrievable by id.
     ///
     /// # Panics
     /// Panics if `embedding.len()` differs from previously inserted vectors,
     /// or if the index was loaded with `load_mmap` (read-only).
-    pub fn insert(&mut self, embedding: Vec<f32>, payload: L) -> usize {
-        let id = self.inner.insert(embedding);
+    pub fn insert(&mut self, embedding: Vec<f32>, payload: L) -> Result<usize> {
+        let id = self.inner.insert(embedding)?;
         debug_assert_eq!(id, self.payloads.len());
         self.payloads.push(payload);
-        id
+        Ok(id)
     }
 
     // ─── Query ────────────────────────────────────────────────────────────
@@ -152,17 +167,84 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         query: &[f32],
         k:     usize,
         ef:    usize,
-    ) -> Vec<LabeledResult<'a, L>> {
+    ) -> Result<Vec<LabeledResult<'a, L>>> {
         self.inner
-            .search(query, k, ef)
+            .search(query, k, ef)?
             .into_iter()
-            .map(|sr| LabeledResult {
+            .map(|sr| Ok(LabeledResult {
                 id:        sr.id,
                 distance:  sr.distance,
                 payload:   &self.payloads[sr.id],
-                embedding: self.inner.get_vector(sr.id),
-            })
+                embedding: self.inner.get_vector(sr.id)?,
+            }))
             .collect()
+    }
+
+    /// Search with filter-before-top-k eligibility over ids and payloads.
+    pub fn search_filtered<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> Result<Vec<LabeledResult<'a, L>>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
+        self.inner
+            .search_filtered(query, k, ef, |id| accepts(id, &self.payloads[id]))?
+            .into_iter()
+            .map(|result| Ok(LabeledResult {
+                id: result.id,
+                distance: result.distance,
+                payload: &self.payloads[result.id],
+                embedding: self.inner.get_vector(result.id)?,
+            }))
+            .collect()
+    }
+
+    // ─── Deletion ─────────────────────────────────────────────────────────
+
+    /// Soft-delete `id`.  See [`Hnsw::remove`] for the semantics.
+    ///
+    /// The payload is retained so ids stay stable; it becomes unreachable
+    /// through search and is dropped by [`compacted`](Self::compacted).
+    pub fn remove(&mut self, id: usize) -> bool {
+        self.inner.remove(id)
+    }
+
+    /// Clear the tombstone on `id`.
+    pub fn restore(&mut self, id: usize) -> bool {
+        self.inner.restore(id)
+    }
+
+    /// Whether `id` has been tombstoned.
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.inner.is_deleted(id)
+    }
+
+    /// Number of tombstoned slots.
+    pub fn deleted_count(&self) -> usize {
+        self.inner.deleted_count()
+    }
+
+    /// Number of vectors still reachable by search.
+    pub fn live_len(&self) -> usize {
+        self.inner.live_len()
+    }
+
+    /// Rebuild without the deleted entries, carrying payloads across the
+    /// renumbering.
+    ///
+    /// Required before [`save`](Self::save) once anything has been removed:
+    /// the file format cannot record tombstones.
+    pub fn compacted(&self, metric: D, seed: Option<u64>) -> Result<Self> {
+        let (inner, old_ids) = self.inner.compacted(metric, seed)?;
+        let payloads = old_ids
+            .into_iter()
+            .map(|old_id| self.payloads[old_id].clone())
+            .collect();
+        Ok(Self { inner, payloads })
     }
 
     // ─── Direct access ────────────────────────────────────────────────────
@@ -171,13 +253,19 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
     ///
     /// # Panics
     /// Panics if `id >= self.len()`.
-    pub fn get_payload(&self, id: usize) -> &L { &self.payloads[id] }
+    pub fn get_payload(&self, id: usize) -> Result<&L> {
+        self.payloads
+            .get(id)
+            .ok_or(crate::Error::IdOutOfBounds { id, len: self.payloads.len() })
+    }
+
+
 
     /// Retrieve the stored embedding for a specific id.
     ///
     /// # Panics
     /// Panics if `id >= self.len()`.
-    pub fn get_embedding(&self, id: usize) -> &[f32] { self.inner.get_vector(id) }
+    pub fn get_embedding(&self, id: usize) -> Result<&[f32]> { self.inner.get_vector(id) }
 
     /// Number of vectors in the index.
     pub fn len(&self) -> usize { self.inner.len() }
@@ -201,6 +289,15 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         persist::save_with_payload(&self.inner, &self.payloads, path)
     }
 
+    /// Serialize a compact snapshot for read-only mmap serving.
+    ///
+    /// The compact format stores only neighbour ids in adjacency lists. Open
+    /// it with [`load_mmap`](Self::load_mmap) or
+    /// [`load_mmap_fixed`](Self::load_mmap_fixed), not [`load`](Self::load).
+    pub fn save_compact(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        persist::save_compact_with_payload(&self.inner, &self.payloads, path)
+    }
+
     /// Load a labeled index from a file, copying vector data into RAM.
     ///
     /// Use this for indexes that fit comfortably in memory.
@@ -221,6 +318,142 @@ impl<D: Distance, L: Payload> LabeledIndex<D, L> {
         let (inner, payloads) = persist::load_mmap_with_payload(path, metric)?;
         Ok(Self { inner, payloads })
     }
+
+    /// Load vectors, graph, and a non-zero fixed-width payload column from one
+    /// read-only mapping.
+    ///
+    /// Payload values are decoded individually when accessed, avoiding the
+    /// `Vec<L>` allocation performed by [`load_mmap`](Self::load_mmap).
+    /// Variable-width payload types return [`io::ErrorKind::InvalidInput`].
+    pub fn load_mmap_fixed(
+        path: impl AsRef<Path>,
+        metric: D,
+    ) -> io::Result<MappedLabeledIndex<D, L>> {
+        MappedLabeledIndex::load(path, metric)
+    }
+}
+
+/// Read-only labeled index whose vectors, graph, and fixed-width payload
+/// column share one file mapping.
+pub struct MappedLabeledIndex<D: Distance, L: Payload> {
+    pub inner: Hnsw<D>,
+    payloads: MappedPayloads<L>,
+}
+
+impl<D: Distance, L: Payload> MappedLabeledIndex<D, L> {
+    /// Open a fixed-width labeled index without materializing its payloads.
+    pub fn load(path: impl AsRef<Path>, metric: D) -> io::Result<Self> {
+        let (inner, payloads) = persist::load_mmap_with_fixed_payload(path, metric)?;
+        Ok(Self { inner, payloads })
+    }
+
+    /// Search and decode only payloads attached to returned neighbors.
+    pub fn search<'a>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        self.decode_results(self.inner.search(query, k, ef)?)
+    }
+
+    /// Search while retaining traversal allocations in a caller-owned
+    /// workspace for reuse by subsequent queries.
+    pub fn search_with_workspace<'a>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        workspace: &mut SearchWorkspace,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        self.decode_results(self.inner.search_with_workspace(query, k, ef, workspace)?)
+    }
+
+    fn decode_results<'a>(
+        &'a self,
+        results: Vec<SearchResult>,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>> {
+        results
+            .into_iter()
+            .map(|result| {
+                Ok(MappedLabeledResult {
+                    id: result.id,
+                    distance: result.distance,
+                    payload: self.payloads.get(result.id)?,
+                    embedding: self.inner.get_vector(result.id)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Search with filter-before-top-k eligibility over lazily decoded
+    /// fixed-width payloads.
+    pub fn search_filtered<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
+        // Reuse the calling thread's workspace rather than allocating a
+        // visited-stamp array proportional to the index size per query.
+        crate::hnsw::with_query_workspace(|workspace| {
+            self.search_filtered_with_workspace(query, k, ef, &accepts, workspace)
+        })
+    }
+
+    /// Filter-before-top-k search with reusable caller-owned traversal storage.
+    pub fn search_filtered_with_workspace<'a, F>(
+        &'a self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accepts: F,
+        workspace: &mut SearchWorkspace,
+    ) -> io::Result<Vec<MappedLabeledResult<'a, L>>>
+    where
+        F: Fn(usize, &L) -> bool,
+    {
+        let decode_error = RefCell::new(None);
+        let results = self.inner.search_filtered_with_workspace(
+            query,
+            k,
+            ef,
+            |id| match self.payloads.get(id) {
+                Ok(payload) => accepts(id, &payload),
+                Err(error) => {
+                    *decode_error.borrow_mut() = Some(error);
+                    false
+                }
+            },
+            workspace,
+        )?;
+        if let Some(error) = decode_error.into_inner() {
+            return Err(error);
+        }
+
+        self.decode_results(results)
+    }
+
+    /// Decode one payload directly from the mapped column.
+    pub fn get_payload(&self, id: usize) -> io::Result<L> {
+        self.payloads.get(id)
+    }
+
+    pub fn get_embedding(&self, id: usize) -> io::Result<&[f32]> {
+        Ok(self.inner.get_vector(id)?)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 // ─── Builder extension ────────────────────────────────────────────────────────
@@ -235,10 +468,13 @@ impl Builder {
     /// let mut idx: LabeledIndex<Euclidean, u32> = Builder::new()
     ///     .m(16)
     ///     .ef_construction(200)
-    ///     .build_labeled(Euclidean);
-    /// idx.insert(vec![1.0, 2.0], 42_u32);
+    ///     .build_labeled(Euclidean).unwrap();
+    /// idx.insert(vec![1.0, 2.0], 42_u32).unwrap();
     /// ```
-    pub fn build_labeled<D: Distance, L: Payload>(self, metric: D) -> LabeledIndex<D, L> {
+    pub fn build_labeled<D: Distance, L: Payload>(
+        self,
+        metric: D,
+    ) -> Result<LabeledIndex<D, L>> {
         LabeledIndex::from_builder(self, metric)
     }
 }

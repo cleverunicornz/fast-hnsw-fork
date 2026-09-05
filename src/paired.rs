@@ -17,14 +17,16 @@
 //!
 //! ## Searching
 //!
-//! * [`search_by_a`] — query in the A space; each result carries the
+//! * [`search_by_a`](PairedIndex::search_by_a) — query in the A space; each result carries the
 //!   corresponding B embedding (useful when you want to retrieve B items
 //!   ranked by A-space similarity).
-//! * [`search_by_b`] — symmetric, queries in the B space.
+//! * [`search_by_b`](PairedIndex::search_by_b) — symmetric, queries in the B space.
 //!
-//! Both return [`PairedResult`] which carries both embeddings and both
-//! distances (the queried distance is `distance`, the cross-space distance is
-//! `cross_distance` — computed lazily on request via [`PairedResult::cross_distance`]).
+//! Both return [`PairedResult`], which carries the distance in the space that
+//! was queried together with both embeddings.  There is deliberately no
+//! cross-space distance: the two spaces have independent metrics and scales,
+//! so a distance in the other space is only meaningful against a query in that
+//! space.  Compute one explicitly from `emb_a`/`emb_b` if you need it.
 //!
 //! ## Persistence
 //!
@@ -42,23 +44,24 @@
 //! let mut idx: PairedIndex<Euclidean, Euclidean> = PairedIndex::new(
 //!     Default::default(), Euclidean,
 //!     Default::default(), Euclidean,
-//! );
+//! )?;
 //!
-//! idx.insert(vec![1.0, 0.0, 0.0, 0.0], vec![0.9, 0.1, 0.0]);  // item 0
-//! idx.insert(vec![0.0, 1.0, 0.0, 0.0], vec![0.0, 0.8, 0.2]);  // item 1
-//! idx.insert(vec![0.0, 0.0, 1.0, 0.0], vec![0.1, 0.1, 0.9]);  // item 2
+//! idx.insert(vec![1.0, 0.0, 0.0, 0.0], vec![0.9, 0.1, 0.0]).unwrap();  // item 0
+//! idx.insert(vec![0.0, 1.0, 0.0, 0.0], vec![0.0, 0.8, 0.2]).unwrap();  // item 1
+//! idx.insert(vec![0.0, 0.0, 1.0, 0.0], vec![0.1, 0.1, 0.9]).unwrap();  // item 2
 //!
 //! // Query in A-space → get B-space embeddings for the nearest items.
 //! let text_query = vec![0.9, 0.1, 0.0, 0.0];
-//! for hit in idx.search_by_a(&text_query, 2, 20) {
+//! for hit in idx.search_by_a(&text_query, 2, 20).unwrap() {
 //!     println!("id={} text_dist={:.3} image_emb={:?}", hit.id, hit.distance, hit.emb_b);
 //! }
 //!
 //! // Query in B-space → get A-space (text) embeddings for the nearest items.
 //! let image_query = vec![0.2, 0.7, 0.1];
-//! for hit in idx.search_by_b(&image_query, 2, 20) {
+//! for hit in idx.search_by_b(&image_query, 2, 20).unwrap() {
 //!     println!("id={} image_dist={:.3} text_emb={:?}", hit.id, hit.distance, hit.emb_a);
 //! }
+//! # Ok::<(), fast_hnsw::Error>(())
 //! ```
 
 use std::io;
@@ -66,6 +69,7 @@ use std::path::Path;
 
 use crate::Builder;
 use crate::distance::Distance;
+use crate::error::{Error, Result};
 use crate::hnsw::{Config, Hnsw};
 use crate::persist;
 
@@ -114,11 +118,11 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     pub fn new(
         config_a: Config, metric_a: A,
         config_b: Config, metric_b: B,
-    ) -> Self {
-        Self {
-            index_a: Hnsw::new(config_a, metric_a),
-            index_b: Hnsw::new(config_b, metric_b),
-        }
+    ) -> Result<Self> {
+        Ok(Self {
+            index_a: Hnsw::new(config_a, metric_a)?,
+            index_b: Hnsw::new(config_b, metric_b)?,
+        })
     }
 
     /// Build both sides from a shared [`Builder`] config (same `M`, `ef`,
@@ -135,12 +139,11 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     ///     Euclidean, Cosine,
     /// );
     /// ```
-    pub fn from_builder(builder: Builder, metric_a: A, metric_b: B) -> Self {
-        let cfg = builder.into_config();
-        Self {
-            index_a: Hnsw::new(cfg.clone(), metric_a),
-            index_b: Hnsw::new(cfg, metric_b),
-        }
+    pub fn from_builder(builder: Builder, metric_a: A, metric_b: B) -> Result<Self> {
+        Ok(Self {
+            index_a: builder.clone().build(metric_a)?,
+            index_b: builder.build(metric_b)?,
+        })
     }
 
     // ─── Mutation ─────────────────────────────────────────────────────────
@@ -154,11 +157,11 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     /// * Panics if `emb_a.len()` or `emb_b.len()` is inconsistent with
     ///   previously inserted vectors on the respective side.
     /// * Panics if either index was loaded with `load_mmap` (read-only).
-    pub fn insert(&mut self, emb_a: Vec<f32>, emb_b: Vec<f32>) -> usize {
-        let id_a = self.index_a.insert(emb_a);
-        let id_b = self.index_b.insert(emb_b);
+    pub fn insert(&mut self, emb_a: Vec<f32>, emb_b: Vec<f32>) -> Result<usize> {
+        let id_a = self.index_a.insert(emb_a)?;
+        let id_b = self.index_b.insert(emb_b)?;
         debug_assert_eq!(id_a, id_b, "PairedIndex: side-A and side-B id mismatch");
-        id_a
+        Ok(id_a)
     }
 
     // ─── Query ────────────────────────────────────────────────────────────
@@ -178,16 +181,16 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
         query: &[f32],
         k:     usize,
         ef:    usize,
-    ) -> Vec<PairedResult<'a>> {
+    ) -> Result<Vec<PairedResult<'a>>> {
         self.index_a
-            .search(query, k, ef)
+            .search(query, k, ef)?
             .into_iter()
-            .map(|sr| PairedResult {
+            .map(|sr| Ok(PairedResult {
                 id:       sr.id,
                 distance: sr.distance,
-                emb_a:    self.index_a.get_vector(sr.id),
-                emb_b:    self.index_b.get_vector(sr.id),
-            })
+                emb_a:    self.index_a.get_vector(sr.id)?,
+                emb_b:    self.index_b.get_vector(sr.id)?,
+            }))
             .collect()
     }
 
@@ -200,26 +203,101 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
         query: &[f32],
         k:     usize,
         ef:    usize,
-    ) -> Vec<PairedResult<'a>> {
+    ) -> Result<Vec<PairedResult<'a>>> {
         self.index_b
-            .search(query, k, ef)
+            .search(query, k, ef)?
             .into_iter()
-            .map(|sr| PairedResult {
+            .map(|sr| Ok(PairedResult {
                 id:       sr.id,
                 distance: sr.distance,
-                emb_a:    self.index_a.get_vector(sr.id),
-                emb_b:    self.index_b.get_vector(sr.id),
-            })
+                emb_a:    self.index_a.get_vector(sr.id)?,
+                emb_b:    self.index_b.get_vector(sr.id)?,
+            }))
             .collect()
+    }
+
+    // ─── Deletion ─────────────────────────────────────────────────────────
+    //
+    // Both graphs are addressed by one shared id space, so every deletion has
+    // to land on both. These methods exist precisely so callers cannot
+    // tombstone one side and leave the other reachable — a state in which
+    // `search_by_a` and `search_by_b` disagree about which items exist.
+
+    /// Soft-delete `id` from **both** sides. Returns `false` if it was already
+    /// deleted or is out of range.
+    ///
+    /// See [`Hnsw::remove`] for the tombstone semantics. Ids of surviving
+    /// items never shift, which is what keeps the two sides aligned.
+    pub fn remove(&mut self, id: usize) -> bool {
+        let removed_a = self.index_a.remove(id);
+        let removed_b = self.index_b.remove(id);
+        debug_assert_eq!(
+            removed_a, removed_b,
+            "PairedIndex: sides disagreed about deleting id {id}",
+        );
+        removed_a || removed_b
+    }
+
+    /// Clear the tombstone on `id` on both sides.
+    pub fn restore(&mut self, id: usize) -> bool {
+        let restored_a = self.index_a.restore(id);
+        let restored_b = self.index_b.restore(id);
+        debug_assert_eq!(
+            restored_a, restored_b,
+            "PairedIndex: sides disagreed about restoring id {id}",
+        );
+        restored_a || restored_b
+    }
+
+    /// Whether `id` has been tombstoned.
+    ///
+    /// Reads the A side. The two are kept identical by [`remove`](Self::remove)
+    /// and [`restore`](Self::restore); reaching into the public `index_a` /
+    /// `index_b` fields to delete from one side directly bypasses that and is
+    /// not supported.
+    pub fn is_deleted(&self, id: usize) -> bool {
+        self.index_a.is_deleted(id)
+    }
+
+    /// Number of tombstoned ids.
+    pub fn deleted_count(&self) -> usize {
+        self.index_a.deleted_count()
+    }
+
+    /// Number of items still reachable by search.
+    pub fn live_len(&self) -> usize {
+        self.index_a.live_len()
+    }
+
+    /// Rebuild both sides without the deleted items.
+    ///
+    /// Ids are renumbered densely, and because both sides carry the same
+    /// tombstones they are renumbered *identically* — the pairing survives.
+    /// Required before [`save`](Self::save) once anything has been removed:
+    /// the file format cannot record tombstones.
+    ///
+    /// # Panics
+    /// Panics if the two sides carry different tombstones, which can only
+    /// happen if they were deleted from individually through the public
+    /// fields.
+    pub fn compacted(&self, metric_a: A, metric_b: B, seed: Option<u64>) -> Result<Self> {
+        let (index_a, survivors_a) = self.index_a.compacted(metric_a, seed)?;
+        let (index_b, survivors_b) = self.index_b.compacted(metric_b, seed)?;
+        if survivors_a != survivors_b {
+            return Err(Error::DesynchronizedPair);
+        }
+        Ok(Self { index_a, index_b })
     }
 
     // ─── Direct access ────────────────────────────────────────────────────
 
     /// Retrieve the A-side embedding for a specific id.
-    pub fn get_emb_a(&self, id: usize) -> &[f32] { self.index_a.get_vector(id) }
+    pub fn get_emb_a(&self, id: usize) -> Result<&[f32]> { self.index_a.get_vector(id) }
+
+
 
     /// Retrieve the B-side embedding for a specific id.
-    pub fn get_emb_b(&self, id: usize) -> &[f32] { self.index_b.get_vector(id) }
+    pub fn get_emb_b(&self, id: usize) -> Result<&[f32]> { self.index_b.get_vector(id) }
 
     /// Number of items in the index (same for both sides by construction).
     pub fn len(&self) -> usize { self.index_a.len() }
@@ -241,11 +319,25 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
     /// # Example
     /// ```no_run
     /// # use fast_hnsw::paired::PairedIndex; use fast_hnsw::distance::Euclidean;
-    /// # let idx: PairedIndex<Euclidean, Euclidean> = PairedIndex::new(Default::default(), Euclidean, Default::default(), Euclidean);
+    /// # let idx: PairedIndex<Euclidean, Euclidean> = PairedIndex::new(Default::default(), Euclidean, Default::default(), Euclidean).unwrap();
     /// idx.save("my_index").unwrap();
     /// // Writes: my_index_a.hnsw  my_index_b.hnsw
     /// ```
     pub fn save(&self, base_path: impl AsRef<Path>) -> io::Result<()> {
+        // Catch tombstones here rather than letting the A-side writer fail
+        // with advice that names `Hnsw::compacted` — for a paired index the
+        // sides must be compacted together, or their id spaces diverge.
+        if self.deleted_count() > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "paired index has {} deleted item(s), which this format cannot \
+                     record; call PairedIndex::compacted to rebuild both sides \
+                     together before saving",
+                    self.deleted_count()
+                ),
+            ));
+        }
         let base = base_path.as_ref();
         let path_a = side_path(base, 'a');
         let path_b = side_path(base, 'b');
@@ -296,6 +388,18 @@ impl<A: Distance, B: Distance> PairedIndex<A, B> {
         let base    = base_path.as_ref();
         let index_a = persist::load_mmap(side_path(base, 'a'), metric_a)?;
         let index_b = persist::load_mmap(side_path(base, 'b'), metric_b)?;
+        // Same pairing check as `load`: the two sides are separate files and
+        // every lookup assumes a shared id space, so mismatched files must be
+        // rejected here rather than panicking on a later cross-side access.
+        if index_a.len() != index_b.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "side-A has {} vectors but side-B has {} — mismatched files?",
+                    index_a.len(), index_b.len()
+                ),
+            ));
+        }
         Ok(Self { index_a, index_b })
     }
 }
@@ -313,15 +417,15 @@ impl Builder {
     /// let mut idx = Builder::new()
     ///     .m(16)
     ///     .ef_construction(200)
-    ///     .build_paired(Euclidean, Cosine);
+    ///     .build_paired(Euclidean, Cosine).unwrap();
     ///
-    /// idx.insert(vec![1.0, 0.0], vec![0.0, 0.0, 1.0]);
+    /// idx.insert(vec![1.0, 0.0], vec![0.0, 0.0, 1.0]).unwrap();
     /// ```
     pub fn build_paired<A: Distance, B: Distance>(
         self,
         metric_a: A,
         metric_b: B,
-    ) -> PairedIndex<A, B> {
+    ) -> Result<PairedIndex<A, B>> {
         PairedIndex::from_builder(self, metric_a, metric_b)
     }
 }

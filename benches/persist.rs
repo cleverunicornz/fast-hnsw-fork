@@ -102,25 +102,25 @@ fn label_string(id: usize) -> String {
 fn build_hnsw(corpus: &[Vec<f32>]) -> Hnsw<Euclidean> {
     let mut idx = Builder::new()
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
-        .build(Euclidean);
-    for v in corpus { idx.insert(v.clone()); }
+        .build(Euclidean).unwrap();
+    for v in corpus { idx.insert(v.clone()).unwrap(); }
     idx
 }
 
 fn build_labeled_u32(corpus: &[Vec<f32>]) -> LabeledIndex<Euclidean, u32> {
     let mut idx = Builder::new()
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
-        .build_labeled(Euclidean);
-    for (i, v) in corpus.iter().enumerate() { idx.insert(v.clone(), i as u32); }
+        .build_labeled(Euclidean).unwrap();
+    for (i, v) in corpus.iter().enumerate() { idx.insert(v.clone(), i as u32).unwrap(); }
     idx
 }
 
 fn build_labeled_string(corpus: &[Vec<f32>]) -> LabeledIndex<Euclidean, String> {
     let mut idx = Builder::new()
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
-        .build_labeled(Euclidean);
+        .build_labeled(Euclidean).unwrap();
     for (i, v) in corpus.iter().enumerate() {
-        idx.insert(v.clone(), label_string(i));
+        idx.insert(v.clone(), label_string(i)).unwrap();
     }
     idx
 }
@@ -129,10 +129,10 @@ fn build_labeled_vec_f32(corpus: &[Vec<f32>], sec_dim: usize) -> LabeledIndex<Eu
     let mut rng = SmallRng::seed_from_u64(99);
     let mut idx = Builder::new()
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
-        .build_labeled(Euclidean);
+        .build_labeled(Euclidean).unwrap();
     for v in corpus {
         let sec: Vec<f32> = (0..sec_dim).map(|_| rng.random::<f32>()).collect();
-        idx.insert(v.clone(), sec);
+        idx.insert(v.clone(), sec).unwrap();
     }
     idx
 }
@@ -140,9 +140,9 @@ fn build_labeled_vec_f32(corpus: &[Vec<f32>], sec_dim: usize) -> LabeledIndex<Eu
 fn build_paired(corpus_a: &[Vec<f32>], corpus_b: &[Vec<f32>]) -> PairedIndex<Euclidean, Euclidean> {
     let mut idx = Builder::new()
         .m(M).ef_construction(EF_CONSTRUCTION).seed(1)
-        .build_paired(Euclidean, Euclidean);
+        .build_paired(Euclidean, Euclidean).unwrap();
     for (a, b) in corpus_a.iter().zip(corpus_b.iter()) {
-        idx.insert(a.clone(), b.clone());
+        idx.insert(a.clone(), b.clone()).unwrap();
     }
     idx
 }

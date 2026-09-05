@@ -1,0 +1,15 @@
+[package]
+name = "semble-hnsw-fitness"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Reproducible Semble 0.7.0 fitness harness for fast-hnsw"
+license = "MIT"
+publish = false
+
+[dependencies]
+fast-hnsw = { path = "../..", features = ["parallel"] }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

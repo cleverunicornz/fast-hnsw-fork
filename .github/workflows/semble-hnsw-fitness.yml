@@ -1,0 +1,105 @@
+name: Semble HNSW fitness
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semble-hnsw-fitness-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: cvu-agent-code-x64
+    runs-on: cvu-agent-code-x64
+    timeout-minutes: 240
+    # Image contract: Semble 0.7.0 and the model snapshot are pre-provisioned.
+    # The generator verifies both; this workflow intentionally installs neither.
+    env:
+      CORPUS_SHA: 951dd74fd6cdbe050cb451dc9ab0448836728dbb
+      SEMBLE_MODEL_NAME: minishlab/potion-code-16M-v2
+      HF_HUB_OFFLINE: "1"
+      PYTHONHASHSEED: "0"
+      SEMBLE_HNSW_REQUIRE_CLEAN: "1"
+      SEMBLE_HNSW_REQUIRE_TARGET: "1"
+
+    steps:
+      - name: Check out fast-hnsw fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out exact benchmark corpus
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: cleverunicornz/yeet-code
+          ref: ${{ env.CORPUS_SHA }}
+          path: benchmark-corpus
+          token: ${{ secrets.GH_PAT_REPOS }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify runner and corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpu_count="$(nproc)"
+          if [[ "${cpu_count}" -ne 4 ]]; then
+            echo "expected exactly 4 exposed CPUs, found ${cpu_count}" >&2
+            exit 1
+          fi
+          memory_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+          minimum_kib="$((30 * 1024 * 1024))"
+          if [[ "${memory_kib}" -lt "${minimum_kib}" ]]; then
+            echo "expected at least 30 GiB RAM, found ${memory_kib} KiB" >&2
+            exit 1
+          fi
+          actual_sha="$(git -C benchmark-corpus rev-parse HEAD)"
+          if [[ "${actual_sha}" != "${CORPUS_SHA}" ]]; then
+            echo "wrong corpus revision: ${actual_sha}" >&2
+            exit 1
+          fi
+          if [[ -n "$(git -C benchmark-corpus status --porcelain=v1 --untracked-files=all)" ]]; then
+            echo "corpus checkout is not clean" >&2
+            exit 1
+          fi
+
+      - name: Verify pre-provisioned Semble and generate fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 benchmarks/semble-hnsw-fitness/generate_fixture.py \
+            --corpus benchmark-corpus \
+            --queries benchmarks/semble-hnsw-fitness/queries.json \
+            --output-dir benchmark-artifacts/fixture
+
+      - name: Build graphs and run fitness harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p semble-hnsw-fitness -- \
+            run \
+            --fixture-dir benchmark-artifacts/fixture \
+            --output-dir benchmark-artifacts \
+            --query-repeats 25 \
+            --warmup 3
+
+      - name: Publish job summary
+        shell: bash
+        run: cat benchmark-artifacts/summary.md >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload receipt, fixture, and HNSW artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: semble-hnsw-fitness-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            benchmark-artifacts/receipt.json
+            benchmark-artifacts/summary.md
+            benchmark-artifacts/*.compact.hnsw
+            benchmark-artifacts/fixture/fixture.json
+            benchmark-artifacts/fixture/*.f32le

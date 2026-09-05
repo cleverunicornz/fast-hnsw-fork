@@ -124,17 +124,18 @@ def verify_installed_semble() -> dict[str, str]:
         fail("the runner's pinned Semble package is not installed")
     package_root = Path(next(iter(spec.submodule_search_locations))).resolve()
     observed: dict[str, str] = {}
+    problems: list[str] = []
     for relative, expected in SEMBLE_SOURCE_HASHES.items():
         source = package_root / relative
         if not source.is_file():
-            fail(f"installed Semble source is missing {relative}")
+            problems.append(f"{relative}: missing")
+            continue
         actual = sha256_bytes(source.read_bytes())
         observed[relative] = actual
         if actual != expected:
-            fail(
-                f"installed Semble source drift for {relative}: "
-                f"expected {expected}, found {actual}"
-            )
+            problems.append(f"{relative}: expected {expected}, found {actual}")
+    if problems:
+        fail("installed Semble source drift: " + "; ".join(problems))
     return observed
 
 

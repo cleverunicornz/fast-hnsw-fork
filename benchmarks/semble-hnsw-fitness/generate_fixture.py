@@ -20,9 +20,10 @@ import struct
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 
@@ -35,9 +36,12 @@ MODEL_IDENTIFIER = "minishlab/potion-code-16M-v2"
 MODEL_DIMENSION = 256
 CORPUS_REPOSITORY = "cleverunicornz/yeet-code"
 CORPUS_GIT_SHA = "951dd74fd6cdbe050cb451dc9ab0448836728dbb"
-QUERY_FIXTURE_SHA256 = "0c94e0d1995fd40e03c8cb6ef1835667f959748acf81fa3854fc6d9f9c26f89d"
+QUERY_FIXTURE_SHA256 = (
+    "0c94e0d1995fd40e03c8cb6ef1835667f959748acf81fa3854fc6d9f9c26f89d"
+)
 TOP_K = 10
 CANDIDATE_MULTIPLIER = 5
+DIRECT_COSINE_SCORE_TOLERANCE = 5e-4
 CANDIDATE_COUNT = TOP_K * CANDIDATE_MULTIPLIER
 
 # These hashes bind installed code to cleverunicornz/semble@v0.7.0. They are
@@ -106,8 +110,7 @@ def git(corpus: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(corpus), *args],
         check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
     if result.returncode != 0:
@@ -139,14 +142,18 @@ def verify_queries(path: Path) -> tuple[list[dict[str, Any]], str]:
     raw = path.read_bytes()
     digest = sha256_bytes(raw)
     if digest != QUERY_FIXTURE_SHA256:
-        fail(f"authoritative query fixture drift: expected {QUERY_FIXTURE_SHA256}, found {digest}")
+        fail(
+            f"authoritative query fixture drift: expected {QUERY_FIXTURE_SHA256}, found {digest}"
+        )
     queries = json.loads(raw)
     if not isinstance(queries, list) or len(queries) != 36:
         fail("the authoritative query fixture must contain exactly 36 entries")
     for index, query in enumerate(queries, 1):
         expected_id = f"y{index:02d}"
         if query.get("id") != expected_id:
-            fail(f"query fixture must contain ordered ids y01 through y36; missing {expected_id}")
+            fail(
+                f"query fixture must contain ordered ids y01 through y36; missing {expected_id}"
+            )
         if query.get("kind") not in {"nl", "sym"}:
             fail(f"query {expected_id} has an invalid kind")
         if not query.get("query") or not query.get("targets"):
@@ -200,7 +207,9 @@ def verify_corpus(corpus: Path) -> dict[str, Any]:
 def matrix_bytes(matrix: np.ndarray, expected_columns: int) -> bytes:
     array = np.asarray(matrix, dtype=np.float32, order="C")
     if array.ndim != 2 or array.shape[1] != expected_columns:
-        fail(f"matrix shape drift: expected (*, {expected_columns}), found {array.shape}")
+        fail(
+            f"matrix shape drift: expected (*, {expected_columns}), found {array.shape}"
+        )
     if not np.isfinite(array).all():
         fail("matrix contains non-finite values")
     norms = np.linalg.norm(array.astype(np.float64), axis=1)
@@ -220,7 +229,11 @@ def verify_direct_cosine_parity(
     query = queries[0]
     vector_norms = np.linalg.norm(vectors, axis=1)
     query_norm = np.linalg.norm(query)
-    if np.any(vector_norms <= 0) or not np.isfinite(vector_norms).all() or query_norm <= 0:
+    if (
+        np.any(vector_norms <= 0)
+        or not np.isfinite(vector_norms).all()
+        or query_norm <= 0
+    ):
         fail("direct cosine parity encountered an invalid exported vector norm")
     similarities = vectors.dot(query) / (vector_norms * query_norm)
     direct_indices = np.argsort(-similarities, kind="stable")[:CANDIDATE_COUNT]
@@ -228,32 +241,55 @@ def verify_direct_cosine_parity(
         [chunk_to_index[result.chunk] for result in recorded],
         dtype=np.int64,
     )
+    rank_order_equal = np.array_equal(direct_indices, recorded_indices)
     top_k_set_equal = set(map(int, direct_indices)) == set(map(int, recorded_indices))
     top_1_equal = int(direct_indices[0]) == int(recorded_indices[0])
     scores_match = all(
         np.isclose(
             float(result.score),
             float(similarities[chunk_to_index[result.chunk]]),
-            rtol=2e-5,
-            atol=2e-5,
+            rtol=DIRECT_COSINE_SCORE_TOLERANCE,
+            atol=DIRECT_COSINE_SCORE_TOLERANCE,
         )
         for result in recorded
     )
-    if not top_k_set_equal or not top_1_equal or not scores_match:
+    direct_set = set(map(int, direct_indices))
+    recorded_set = set(map(int, recorded_indices))
+    score_deltas = [
+        abs(float(result.score) - float(similarities[chunk_to_index[result.chunk]]))
+        for result in recorded
+    ]
+    if (
+        not rank_order_equal
+        or not top_k_set_equal
+        or not top_1_equal
+        or not scores_match
+    ):
         fail(
             "Semble exact dense control did not match direct brute-force cosine "
-            "over the exported vectors for y01"
+            "over the exported vectors for y01: "
+            f"set_equal={top_k_set_equal}, top_1_equal={top_1_equal}, "
+            f"rank_order_equal={rank_order_equal}, "
+            f"scores_match={scores_match}, "
+            f"direct_only={sorted(direct_set - recorded_set)[:10]}, "
+            f"recorded_only={sorted(recorded_set - direct_set)[:10]}, "
+            f"max_score_delta={max(score_deltas, default=0.0):.9g}"
         )
     return {
         "brute_force_query_id": "y01",
         "brute_force_top_k": CANDIDATE_COUNT,
+        "brute_force_rank_order_equal": rank_order_equal,
         "brute_force_top_k_set_equal": top_k_set_equal,
         "brute_force_top_1_equal": top_1_equal,
         "brute_force_scores_match": scores_match,
+        "brute_force_max_score_delta": max(score_deltas, default=0.0),
+        "brute_force_score_tolerance": DIRECT_COSINE_SCORE_TOLERANCE,
     }
 
 
-def ranked_hits(results: list[Any], chunk_to_index: dict[Any, int]) -> list[dict[str, Any]]:
+def ranked_hits(
+    results: list[Any], chunk_to_index: dict[Any, int]
+) -> list[dict[str, Any]]:
     return [
         {"chunk_index": chunk_to_index[result.chunk], "score": float(result.score)}
         for result in results
@@ -323,7 +359,9 @@ def main() -> None:
         fail("PYTHONHASHSEED must be exactly 0 for deterministic Semble tie behavior")
     configured_model = os.environ.get("SEMBLE_MODEL_NAME", MODEL_IDENTIFIER)
     if configured_model != MODEL_IDENTIFIER:
-        fail(f"SEMBLE_MODEL_NAME drift: expected {MODEL_IDENTIFIER}, found {configured_model}")
+        fail(
+            f"SEMBLE_MODEL_NAME drift: expected {MODEL_IDENTIFIER}, found {configured_model}"
+        )
     if os.environ.get("HF_HUB_OFFLINE") != "1":
         fail("HF_HUB_OFFLINE must be 1 so the pinned runner model cannot be replaced")
 
@@ -346,10 +384,13 @@ def main() -> None:
     )
     from semble.types import ContentType
     from semble.version import __version__
+    from vicinity.utils import normalize
 
     distribution_version = importlib.metadata.version("semble")
     if __version__ != SEMBLE_VERSION:
-        fail(f"installed Semble version drift: expected {SEMBLE_VERSION}, found {__version__}")
+        fail(
+            f"installed Semble version drift: expected {SEMBLE_VERSION}, found {__version__}"
+        )
     if distribution_version != SEMBLE_VERSION:
         fail(
             f"installed Semble distribution drift: expected {SEMBLE_VERSION}, "
@@ -379,8 +420,12 @@ def main() -> None:
             display_root=corpus,
         )
 
-    (bm25_index, semantic_index, chunks, manifest), semble_index_us = timed(create_index)
-    dense_backend = f"{type(semantic_index).__module__}.{type(semantic_index).__qualname__}"
+    (bm25_index, semantic_index, chunks, manifest), semble_index_us = timed(
+        create_index
+    )
+    dense_backend = (
+        f"{type(semantic_index).__module__}.{type(semantic_index).__qualname__}"
+    )
     dense_backend_verified = type(semantic_index) is SelectableBasicBackend
     if not dense_backend_verified:
         fail(
@@ -398,7 +443,9 @@ def main() -> None:
         manifest=manifest,
     )
     if len(chunks) < CANDIDATE_COUNT:
-        fail(f"corpus produced only {len(chunks)} chunks; at least {CANDIDATE_COUNT} are required")
+        fail(
+            f"corpus produced only {len(chunks)} chunks; at least {CANDIDATE_COUNT} are required"
+        )
 
     chunk_to_index = {chunk: index for index, chunk in enumerate(chunks)}
     if len(chunk_to_index) != len(chunks):
@@ -454,8 +501,12 @@ def main() -> None:
     drafts: list[QueryDraft] = []
     query_vector_rows: list[np.ndarray] = []
     for definition in query_definitions:
-        prepared, prepare_us = timed(lambda definition=definition: index.prepare_query(definition["query"]))
-        embedding = np.asarray(prepared.embedding, dtype=np.float32).reshape(-1)
+        prepared, prepare_us = timed(
+            lambda definition=definition: index.prepare_query(definition["query"])
+        )
+        embedding = np.asarray(normalize(prepared.embedding), dtype=np.float32).reshape(
+            -1
+        )
         if embedding.shape != (MODEL_DIMENSION,):
             fail(f"query {definition['id']} embedding shape drift: {embedding.shape}")
         query_vector_rows.append(embedding)
@@ -493,7 +544,9 @@ def main() -> None:
         bm25_chunks = {result.chunk for result in bm25 if result.score}
         control_candidate_order = [
             chunk_to_index[chunk]
-            for chunk in sorted(semantic_chunks | bm25_chunks, key=lambda chunk: chunk.start_line)
+            for chunk in sorted(
+                semantic_chunks | bm25_chunks, key=lambda chunk: chunk.start_line
+            )
         ]
         existing, injected = boost_recipe(
             definition["query"], chunks, chunk_to_index, apply_query_boost
@@ -523,9 +576,7 @@ def main() -> None:
         files = shadow_file_order[:count]
         file_set = set(files)
         chunk_indices = sorted(
-            chunk_to_index[chunk]
-            for chunk in chunks
-            if chunk.file_path in file_set
+            chunk_to_index[chunk] for chunk in chunks if chunk.file_path in file_set
         )
         shadow_sets.append(
             {
@@ -539,13 +590,15 @@ def main() -> None:
     shadow_exclusions: dict[str, Any] = {}
     shadow_membership_verified = True
     for shadow in shadow_sets:
-        oracle_excluded = index.indices_for_paths(set(shadow["files"]))
+        oracle_excluded = (
+            index.indices_for_paths(set(shadow["files"])) if shadow["files"] else None
+        )
         oracle_indices = (
             []
             if oracle_excluded is None
-            else [int(index) for index in oracle_excluded.tolist()]
+            else sorted(int(value) for value in oracle_excluded)
         )
-        serialized_indices = [int(index) for index in shadow["chunk_indices"]]
+        serialized_indices = sorted(int(value) for value in shadow["chunk_indices"])
         membership_equal = oracle_indices == serialized_indices
         shadow_membership_verified = shadow_membership_verified and membership_equal
         if not membership_equal:
@@ -577,7 +630,9 @@ def main() -> None:
                 )
             shadowed = set(shadow["files"])
             if any(result.chunk.file_path in shadowed for result in results):
-                fail(f"Semble exact control emitted a shadowed file for {shadow['name']}")
+                fail(
+                    f"Semble exact control emitted a shadowed file for {shadow['name']}"
+                )
             filtered_exact[shadow["name"]] = ranked_hits(results, chunk_to_index)
             filtered_total_us += elapsed_us
         timings = dict(draft.timings_us)
@@ -669,7 +724,8 @@ def main() -> None:
                 resolved_model == MODEL_IDENTIFIER and int(model.dim) == MODEL_DIMENSION
             ),
             "corpus_identity_verified": (
-                corpus_identity["git_sha"] == CORPUS_GIT_SHA and corpus_identity["clean"]
+                corpus_identity["git_sha"] == CORPUS_GIT_SHA
+                and corpus_identity["clean"]
             ),
             "dense_backend": dense_backend,
             "dense_backend_verified": dense_backend_verified,
@@ -741,7 +797,8 @@ def main() -> None:
         },
     }
     encoded_fixture = (
-        json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+        json.dumps(fixture, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        + "\n"
     ).encode("utf-8")
     write_atomic(output_dir / "fixture.json", encoded_fixture)
     print(

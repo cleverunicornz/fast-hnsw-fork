@@ -87,9 +87,12 @@ pub struct OracleChecks {
     pub dense_backend_verified: bool,
     pub brute_force_query_id: String,
     pub brute_force_top_k: usize,
+    pub brute_force_rank_order_equal: bool,
     pub brute_force_top_k_set_equal: bool,
     pub brute_force_top_1_equal: bool,
     pub brute_force_scores_match: bool,
+    pub brute_force_max_score_delta: f64,
+    pub brute_force_score_tolerance: f64,
     pub shadow_membership_verified: bool,
 }
 
@@ -99,9 +102,14 @@ impl OracleChecks {
             && self.model_identity_verified
             && self.corpus_identity_verified
             && self.dense_backend_verified
+            && self.brute_force_rank_order_equal
             && self.brute_force_top_k_set_equal
             && self.brute_force_top_1_equal
             && self.brute_force_scores_match
+            && self.brute_force_max_score_delta.is_finite()
+            && self.brute_force_score_tolerance.is_finite()
+            && self.brute_force_score_tolerance > 0.0
+            && self.brute_force_max_score_delta <= self.brute_force_score_tolerance
             && self.shadow_membership_verified
     }
 }
@@ -305,8 +313,7 @@ pub fn validate_fixture(fixture: &Fixture) -> io::Result<()> {
         "fixture oracle evidence contains a failed check",
     )?;
     require(
-        fixture.oracle_checks.dense_backend
-            == "semble.index.dense.SelectableBasicBackend"
+        fixture.oracle_checks.dense_backend == "semble.index.dense.SelectableBasicBackend"
             && fixture.oracle_checks.brute_force_query_id == "y01"
             && fixture.oracle_checks.brute_force_top_k == 50,
         "fixture dense exactness evidence drifted",
@@ -349,9 +356,7 @@ pub fn validate_fixture(fixture: &Fixture) -> io::Result<()> {
             format!("chunk {index} has an invalid line range"),
         )?;
         require(
-            chunk.path_penalty.is_finite()
-                && chunk.path_penalty > 0.0
-                && chunk.path_penalty <= 1.0,
+            chunk.path_penalty.is_finite() && chunk.path_penalty > 0.0 && chunk.path_penalty <= 1.0,
             format!("chunk {index} has an invalid path penalty"),
         )?;
     }
@@ -397,7 +402,10 @@ pub fn validate_fixture(fixture: &Fixture) -> io::Result<()> {
         for (shadow_name, hits) in &query.filtered_exact {
             require(
                 hits.len() == candidate_count,
-                format!("query {} filtered control {shadow_name} is incomplete", query.id),
+                format!(
+                    "query {} filtered control {shadow_name} is incomplete",
+                    query.id
+                ),
             )?;
             validate_hits(hits, fixture.chunks.len(), &query.id)?;
         }
@@ -508,7 +516,10 @@ fn validate_hits(hits: &[RankedHit], chunk_count: usize, query_id: &str) -> io::
 }
 
 fn read_matrix(fixture_dir: &Path, spec: &MatrixFile) -> io::Result<Vec<Vec<f32>>> {
-    require(is_plain_filename(&spec.file), "matrix file must be a plain filename")?;
+    require(
+        is_plain_filename(&spec.file),
+        "matrix file must be a plain filename",
+    )?;
     let bytes = fs::read(fixture_dir.join(&spec.file))?;
     let expected_bytes = spec
         .rows
@@ -531,7 +542,10 @@ pub fn decode_f32_matrix(bytes: &[u8], rows: usize, columns: usize) -> io::Resul
         .checked_mul(columns)
         .and_then(|count| count.checked_mul(4))
         .ok_or_else(|| invalid_data("matrix dimensions overflow"))?;
-    require(bytes.len() == expected, "matrix dimensions do not match its bytes")?;
+    require(
+        bytes.len() == expected,
+        "matrix dimensions do not match its bytes",
+    )?;
     let mut matrix = Vec::with_capacity(rows);
     for row in bytes.chunks_exact(columns * 4) {
         let decoded = row
@@ -715,12 +729,12 @@ pub fn reconstruct_hybrid(
     let mut dense_seen = HashSet::new();
     for (rank, id) in dense_ids.iter().take(candidate_count).enumerate() {
         if *id >= fixture.chunks.len() || !dense_seen.insert(*id) {
-            return Err(format!("query {} has invalid dense candidate ids", query.id));
+            return Err(format!(
+                "query {} has invalid dense candidate ids",
+                query.id
+            ));
         }
-        scores.insert(
-            *id,
-            query.alpha / (fixture.ranking.rrf_k + rank + 1) as f64,
-        );
+        scores.insert(*id, query.alpha / (fixture.ranking.rrf_k + rank + 1) as f64);
     }
     for (rank, hit) in query.bm25.iter().take(candidate_count).enumerate() {
         *scores.entry(hit.chunk_index).or_default() +=
@@ -1167,9 +1181,12 @@ mod tests {
             dense_backend_verified: true,
             brute_force_query_id: "y01".into(),
             brute_force_top_k: 50,
+            brute_force_rank_order_equal: true,
             brute_force_top_k_set_equal: true,
             brute_force_top_1_equal: true,
             brute_force_scores_match: true,
+            brute_force_max_score_delta: 0.0,
+            brute_force_score_tolerance: 5e-4,
             shadow_membership_verified: true,
         }
     }

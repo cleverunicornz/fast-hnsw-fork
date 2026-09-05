@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use semble_hnsw_fitness::{
-    control_agreement, load_fixture, recall_metrics, reconstruct_hybrid,
-    returned_count_summary, sha256_file, target_metrics, validate_filtered_candidates,
-    verify_hybrid_controls, ControlAgreement, Fixture, RecallMetrics, ReturnedCountSummary,
-    TargetMetrics, EXPECTED_CORPUS_REPOSITORY, EXPECTED_CORPUS_SHA, EXPECTED_DIMENSION,
-    EXPECTED_MODEL, EXPECTED_SEMBLE_REPOSITORY, EXPECTED_SEMBLE_SHA, EXPECTED_SEMBLE_TAG,
-    EXPECTED_SEMBLE_VERSION, RECEIPT_SCHEMA_VERSION,
+    control_agreement, load_fixture, recall_metrics, reconstruct_hybrid, returned_count_summary,
+    sha256_file, target_metrics, validate_filtered_candidates, verify_hybrid_controls,
+    ControlAgreement, Fixture, RecallMetrics, ReturnedCountSummary, TargetMetrics,
+    EXPECTED_CORPUS_REPOSITORY, EXPECTED_CORPUS_SHA, EXPECTED_DIMENSION, EXPECTED_MODEL,
+    EXPECTED_SEMBLE_REPOSITORY, EXPECTED_SEMBLE_SHA, EXPECTED_SEMBLE_TAG, EXPECTED_SEMBLE_VERSION,
+    RECEIPT_SCHEMA_VERSION,
 };
 
 const EFS: [usize; 5] = [50, 100, 200, 400, 800];
@@ -203,6 +203,7 @@ struct ReceiptGates {
     all_results_complete: bool,
     accept_all_filter_matches_dense_hnsw: bool,
     no_shadowed_file_emitted: bool,
+    rejected_nodes_observed_during_filtered_navigation: bool,
 }
 
 impl ReceiptGates {
@@ -218,6 +219,7 @@ impl ReceiptGates {
             && self.all_results_complete
             && self.accept_all_filter_matches_dense_hnsw
             && self.no_shadowed_file_emitted
+            && self.rejected_nodes_observed_during_filtered_navigation
     }
 }
 
@@ -271,14 +273,11 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
     if let Err(error) = hybrid_control_check {
         return Err(invalid(error));
     }
-    let fixture_binary_checksums_verified = sha256_file(
-        &options.fixture_dir.join(&loaded.fixture.vectors.file),
-    )? == loaded.fixture.vectors.sha256
-        && sha256_file(
-            &options
-                .fixture_dir
-                .join(&loaded.fixture.query_vectors.file),
-        )? == loaded.fixture.query_vectors.sha256;
+    let fixture_binary_checksums_verified =
+        sha256_file(&options.fixture_dir.join(&loaded.fixture.vectors.file))?
+            == loaded.fixture.vectors.sha256
+            && sha256_file(&options.fixture_dir.join(&loaded.fixture.query_vectors.file))?
+                == loaded.fixture.query_vectors.sha256;
     if !fixture_binary_checksums_verified {
         return Err(invalid("fixture binary checksum verification failed"));
     }
@@ -311,7 +310,9 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
     let mut builds = Vec::new();
     let mut build_artifacts_verified = true;
     for workers in WORKERS {
-        let shard = options.output_dir.join(format!("build-{workers}.partial.json"));
+        let shard = options
+            .output_dir
+            .join(format!("build-{workers}.partial.json"));
         let artifact = options
             .output_dir
             .join(format!("semble-baseline-w{workers}.compact.hnsw"));
@@ -339,13 +340,8 @@ fn run_parent(options: RunOptions) -> AnyResult<()> {
             )));
         }
         let build: BuildReceipt = serde_json::from_slice(&fs::read(&shard)?)?;
-        let build_validation = validate_build_receipt(
-            &build,
-            &fixture,
-            &fast_hnsw_git_sha,
-            &artifact,
-            workers,
-        );
+        let build_validation =
+            validate_build_receipt(&build, &fixture, &fast_hnsw_git_sha, &artifact, workers);
         build_artifacts_verified = build_artifacts_verified && build_validation.is_ok();
         build_validation?;
         fs::remove_file(shard)?;
@@ -492,7 +488,9 @@ fn run_child(arguments: &[String]) -> AnyResult<()> {
     };
     let graph_build = elapsed_ms(build_started.elapsed());
     if index.len() != fixture.chunks.len() || index.dim() != Some(EXPECTED_DIMENSION) {
-        return Err(invalid("constructed graph shape does not match the fixture"));
+        return Err(invalid(
+            "constructed graph shape does not match the fixture",
+        ));
     }
     let stats = index.stats();
     let graph = GraphReceipt {
@@ -515,7 +513,9 @@ fn run_child(arguments: &[String]) -> AnyResult<()> {
     let mapped = persist::load_mmap(&artifact, Cosine)?;
     let mmap_open = elapsed_ms(mmap_started.elapsed());
     if mapped.len() != fixture.chunks.len() || mapped.dim() != Some(EXPECTED_DIMENSION) {
-        return Err(invalid("mmap-opened graph shape does not match the fixture"));
+        return Err(invalid(
+            "mmap-opened graph shape does not match the fixture",
+        ));
     }
     let mmap_validation_started = Instant::now();
     let mapped_stats = mapped.stats();
@@ -533,7 +533,16 @@ fn run_child(arguments: &[String]) -> AnyResult<()> {
     let evaluation_started = Instant::now();
     let evaluations = EFS
         .iter()
-        .map(|ef| evaluate_ef(&mapped, &fixture, &query_vectors, *ef, query_repeats, warmup))
+        .map(|ef| {
+            evaluate_ef(
+                &mapped,
+                &fixture,
+                &query_vectors,
+                *ef,
+                query_repeats,
+                warmup,
+            )
+        })
         .collect::<AnyResult<Vec<_>>>()?;
     let query_evaluation = elapsed_ms(evaluation_started.elapsed());
     let artifact_bytes = fs::metadata(&artifact)?.len();
@@ -617,7 +626,10 @@ fn evaluate_ef(
         for _ in 0..warmup {
             let warm = index.search_with_workspace(vector, candidate_count, ef, &mut workspace)?;
             if warm.len() != candidate_count {
-                return Err(invalid(format!("query {} warmup result is incomplete", query.id)));
+                return Err(invalid(format!(
+                    "query {} warmup result is incomplete",
+                    query.id
+                )));
             }
         }
         let mut samples = Vec::with_capacity(query_repeats);
@@ -628,7 +640,10 @@ fn evaluate_ef(
             samples.push(elapsed_us(started.elapsed()));
         }
         if results.len() != candidate_count {
-            return Err(invalid(format!("query {} dense result is incomplete", query.id)));
+            return Err(invalid(format!(
+                "query {} dense result is incomplete",
+                query.id
+            )));
         }
         let candidate_ids: Vec<usize> = results.iter().map(|result| result.id).collect();
         let exact_ids: Vec<usize> = query
@@ -664,11 +679,7 @@ fn evaluate_ef(
         let mut accepted_counts = Vec::with_capacity(fixture.queries.len());
         let mut rejected_total = 0usize;
         let mut shadowed_file_emitted = false;
-        for (query_index, (query, vector)) in fixture
-            .queries
-            .iter()
-            .zip(query_vectors)
-            .enumerate()
+        for (query_index, (query, vector)) in fixture.queries.iter().zip(query_vectors).enumerate()
         {
             let mut workspace = SearchWorkspace::new(index.len(), ef);
             for _ in 0..warmup {
@@ -680,8 +691,7 @@ fn evaluate_ef(
                     &shadow_mask,
                     &mut workspace,
                 )?;
-                let warm_ids: Vec<usize> =
-                    warm_results.iter().map(|result| result.id).collect();
+                let warm_ids: Vec<usize> = warm_results.iter().map(|result| result.id).collect();
                 shadowed_file_emitted |= warm_ids.iter().any(|id| shadow_mask[*id]);
                 validate_filtered_candidates(&warm_ids, &shadow_mask).map_err(|error| {
                     invalid(format!(
@@ -714,7 +724,10 @@ fn evaluate_ef(
                 let ids: Vec<usize> = results.iter().map(|result| result.id).collect();
                 shadowed_file_emitted |= ids.iter().any(|id| shadow_mask[*id]);
                 validate_filtered_candidates(&ids, &shadow_mask).map_err(|error| {
-                    invalid(format!("query {} {} failed: {error}", query.id, shadow.name))
+                    invalid(format!(
+                        "query {} {} failed: {error}",
+                        query.id, shadow.name
+                    ))
                 })?;
                 if shadow.file_count == 0 && ids != dense_results[query_index] {
                     return Err(invalid(format!(
@@ -727,7 +740,10 @@ fn evaluate_ef(
             }
             let accepted_returned = candidate_ids.len();
             let exact = query.filtered_exact.get(&shadow.name).ok_or_else(|| {
-                invalid(format!("query {} is missing {} control", query.id, shadow.name))
+                invalid(format!(
+                    "query {} is missing {} control",
+                    query.id, shadow.name
+                ))
             })?;
             let exact_ids: Vec<usize> = exact.iter().map(|result| result.chunk_index).collect();
             let recall = recall_metrics(&candidate_ids, &exact_ids);
@@ -886,11 +902,9 @@ fn validate_build_receipt(
             || evaluation.filtered.iter().any(|scenario| {
                 scenario.shadowed_file_emitted
                     || scenario.queries.len() != fixture.queries.len()
-                    || scenario.accepted_returned.requested
-                        != fixture.ranking.candidate_count()
+                    || scenario.accepted_returned.requested != fixture.ranking.candidate_count()
                     || scenario.accepted_returned.min == 0
-                    || scenario.accepted_returned.max
-                        > fixture.ranking.candidate_count()
+                    || scenario.accepted_returned.max > fixture.ranking.candidate_count()
                     || scenario
                         .queries
                         .iter()
@@ -914,9 +928,7 @@ fn derive_receipt_gates(
     build_artifacts_verified: bool,
     query_repeats: usize,
 ) -> ReceiptGates {
-    let owned_semble_source_verified = fixture
-        .oracle_checks
-        .installed_semble_source_verified
+    let owned_semble_source_verified = fixture.oracle_checks.installed_semble_source_verified
         && fixture.generator.semble_repository == EXPECTED_SEMBLE_REPOSITORY
         && fixture.generator.semble_tag == EXPECTED_SEMBLE_TAG
         && fixture.generator.semble_git_sha == EXPECTED_SEMBLE_SHA
@@ -928,23 +940,30 @@ fn derive_receipt_gates(
     let model_and_dimension_verified = fixture.oracle_checks.model_identity_verified
         && fixture.model.identifier == EXPECTED_MODEL
         && fixture.model.dimension == EXPECTED_DIMENSION;
-    let corpus_revision_and_cleanliness_verified = fixture
-        .oracle_checks
-        .corpus_identity_verified
+    let corpus_revision_and_cleanliness_verified = fixture.oracle_checks.corpus_identity_verified
         && fixture.corpus.repository == EXPECTED_CORPUS_REPOSITORY
         && fixture.corpus.git_sha == EXPECTED_CORPUS_SHA
         && fixture.corpus.clean;
     let dense_control_exactness_verified = fixture.oracle_checks.dense_backend_verified
-        && fixture.oracle_checks.dense_backend
-            == "semble.index.dense.SelectableBasicBackend"
+        && fixture.oracle_checks.dense_backend == "semble.index.dense.SelectableBasicBackend"
         && fixture.oracle_checks.brute_force_query_id == "y01"
         && fixture.oracle_checks.brute_force_top_k == fixture.ranking.candidate_count()
+        && fixture.oracle_checks.brute_force_rank_order_equal
         && fixture.oracle_checks.brute_force_top_k_set_equal
         && fixture.oracle_checks.brute_force_top_1_equal
-        && fixture.oracle_checks.brute_force_scores_match;
-    let shadow_oracle_membership_verified = fixture
-        .oracle_checks
-        .shadow_membership_verified;
+        && fixture.oracle_checks.brute_force_scores_match
+        && fixture
+            .oracle_checks
+            .brute_force_max_score_delta
+            .is_finite()
+        && fixture
+            .oracle_checks
+            .brute_force_score_tolerance
+            .is_finite()
+        && fixture.oracle_checks.brute_force_score_tolerance > 0.0
+        && fixture.oracle_checks.brute_force_max_score_delta
+            <= fixture.oracle_checks.brute_force_score_tolerance;
+    let shadow_oracle_membership_verified = fixture.oracle_checks.shadow_membership_verified;
 
     let all_worker_builds_persisted_and_mmap_opened = build_artifacts_verified
         && builds.len() == WORKERS.len()
@@ -972,13 +991,15 @@ fn derive_receipt_gates(
             else {
                 return false;
             };
-            accept_all.queries.iter().zip(&evaluation.dense.queries).all(
-                |(filtered, dense)| {
+            accept_all
+                .queries
+                .iter()
+                .zip(&evaluation.dense.queries)
+                .all(|(filtered, dense)| {
                     filtered.query_id == dense.query_id
                         && filtered.accepted_returned == fixture.ranking.candidate_count()
                         && filtered.hnsw_top_10 == dense.hnsw_top_10
-                },
-            )
+                })
         })
     });
     let no_shadowed_file_emitted = builds.iter().all(|build| {
@@ -987,6 +1008,13 @@ fn derive_receipt_gates(
                 .filtered
                 .iter()
                 .all(|scenario| !scenario.shadowed_file_emitted)
+        })
+    });
+    let rejected_nodes_observed_during_filtered_navigation = builds.iter().all(|build| {
+        build.evaluations.iter().all(|evaluation| {
+            evaluation.filtered.iter().all(|scenario| {
+                scenario.shadow_file_count == 0 || scenario.rejected_nodes_observed > 0
+            })
         })
     });
     ReceiptGates {
@@ -1001,14 +1029,11 @@ fn derive_receipt_gates(
         all_results_complete,
         accept_all_filter_matches_dense_hnsw,
         no_shadowed_file_emitted,
+        rejected_nodes_observed_during_filtered_navigation,
     }
 }
 
-fn build_results_complete(
-    build: &BuildReceipt,
-    fixture: &Fixture,
-    query_repeats: usize,
-) -> bool {
+fn build_results_complete(build: &BuildReceipt, fixture: &Fixture, query_repeats: usize) -> bool {
     let query_count = fixture.queries.len();
     let candidate_count = fixture.ranking.candidate_count();
     build.evaluations.len() == EFS.len()
@@ -1036,8 +1061,7 @@ fn build_results_complete(
                             query.accepted_returned > 0
                                 && query.latency_us.samples == query_repeats
                                 && query.exact_top_10.len() == 10
-                                && query.hnsw_top_10.len()
-                                    == query.accepted_returned.min(10)
+                                && query.hnsw_top_10.len() == query.accepted_returned.min(10)
                         })
                 })
                 && evaluation.hybrid.queries.len() == query_count
@@ -1071,7 +1095,11 @@ fn render_summary(
         fixture.generator.semble_git_sha,
         fixture.generator.semble_repository
     )?;
-    writeln!(output, "- Model: `{}`, {} dimensions", fixture.model.identifier, fixture.model.dimension)?;
+    writeln!(
+        output,
+        "- Model: `{}`, {} dimensions",
+        fixture.model.identifier, fixture.model.dimension
+    )?;
     writeln!(
         output,
         "- Corpus: `{}` at `{}`; {} files, {} chunks",
@@ -1102,10 +1130,26 @@ fn render_summary(
     writeln!(output)?;
     writeln!(output, "## Controls")?;
     writeln!(output)?;
-    writeln!(output, "- Dense control: {}", fixture.controls.dense_control)?;
-    writeln!(output, "- Dense candidate: {}", fixture.controls.dense_candidate)?;
-    writeln!(output, "- Hybrid control: {}", fixture.controls.hybrid_control)?;
-    writeln!(output, "- Hybrid candidate: {}", fixture.controls.hybrid_candidate)?;
+    writeln!(
+        output,
+        "- Dense control: {}",
+        fixture.controls.dense_control
+    )?;
+    writeln!(
+        output,
+        "- Dense candidate: {}",
+        fixture.controls.dense_candidate
+    )?;
+    writeln!(
+        output,
+        "- Hybrid control: {}",
+        fixture.controls.hybrid_control
+    )?;
+    writeln!(
+        output,
+        "- Hybrid candidate: {}",
+        fixture.controls.hybrid_candidate
+    )?;
     writeln!(output, "- Scope: {}", fixture.controls.delta_scope)?;
     writeln!(output)?;
     writeln!(output, "## Construction")?;
@@ -1211,7 +1255,10 @@ fn render_summary(
     Ok(output)
 }
 
-fn filtered_named<'a>(evaluation: &'a EfEvaluation, name: &str) -> AnyResult<&'a FilteredEvaluation> {
+fn filtered_named<'a>(
+    evaluation: &'a EfEvaluation,
+    name: &str,
+) -> AnyResult<&'a FilteredEvaluation> {
     evaluation
         .filtered
         .iter()
@@ -1384,7 +1431,10 @@ fn filesystem_identity(path: &Path) -> AnyResult<(Option<String>, Option<String>
     }
     let text = String::from_utf8(output.stdout)?;
     let mut fields = text.split_whitespace();
-    Ok((fields.next().map(str::to_owned), fields.next().map(str::to_owned)))
+    Ok((
+        fields.next().map(str::to_owned),
+        fields.next().map(str::to_owned),
+    ))
 }
 
 fn format_bytes(value: Option<u64>) -> String {
@@ -1491,6 +1541,7 @@ mod tests {
             all_results_complete: true,
             accept_all_filter_matches_dense_hnsw: true,
             no_shadowed_file_emitted: true,
+            rejected_nodes_observed_during_filtered_navigation: true,
         };
         assert!(gates.all_passed());
         gates.shadow_oracle_membership_verified = false;

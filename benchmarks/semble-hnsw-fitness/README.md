@@ -53,8 +53,10 @@ ranking contract mismatch before any HNSW result can be reported.
 Fixture generation also requires the dense index to be exactly
 `semble.index.dense.SelectableBasicBackend`. For query `y01`, it decodes the
 same little-endian bytes written to the fixture, performs direct brute-force
-cosine against every row, and requires top-50 set parity, top-1 parity, and
-score parity with the recorded Semble result. Each shadow set independently
+cosine against every row, and requires identical top-50 rank order. Raw
+scores may differ by at most `5e-4` because Semble normalizes the model's
+`float16` query before the fixture exports that effective vector as `float32`.
+Each shadow set independently
 serializes path membership and must exactly match Semble's
 `indices_for_paths(...)` oracle before filtered controls are recorded.
 

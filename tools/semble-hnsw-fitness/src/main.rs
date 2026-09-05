@@ -18,8 +18,8 @@ use semble_hnsw_fitness::{
     sha256_file, target_metrics, validate_filtered_candidates, verify_hybrid_controls,
     ControlAgreement, Fixture, RecallMetrics, ReturnedCountSummary, TargetMetrics,
     EXPECTED_CORPUS_REPOSITORY, EXPECTED_CORPUS_SHA, EXPECTED_DIMENSION, EXPECTED_MODEL,
-    EXPECTED_SEMBLE_REPOSITORY, EXPECTED_SEMBLE_SHA, EXPECTED_SEMBLE_TAG, EXPECTED_SEMBLE_VERSION,
-    RECEIPT_SCHEMA_VERSION,
+    EXPECTED_MODEL_REVISION, EXPECTED_SEMBLE_REPOSITORY, EXPECTED_SEMBLE_SHA, EXPECTED_SEMBLE_TAG,
+    EXPECTED_SEMBLE_VERSION, RECEIPT_SCHEMA_VERSION,
 };
 
 const EFS: [usize; 5] = [50, 100, 200, 400, 800];
@@ -939,6 +939,11 @@ fn derive_receipt_gates(
         });
     let model_and_dimension_verified = fixture.oracle_checks.model_identity_verified
         && fixture.model.identifier == EXPECTED_MODEL
+        && fixture.model.revision == EXPECTED_MODEL_REVISION
+        && fixture.model.source_hashes.len() == 4
+        && fixture.model.source_hashes.values().all(|hash| {
+            hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+        })
         && fixture.model.dimension == EXPECTED_DIMENSION;
     let corpus_revision_and_cleanliness_verified = fixture.oracle_checks.corpus_identity_verified
         && fixture.corpus.repository == EXPECTED_CORPUS_REPOSITORY
@@ -1097,8 +1102,8 @@ fn render_summary(
     )?;
     writeln!(
         output,
-        "- Model: `{}`, {} dimensions",
-        fixture.model.identifier, fixture.model.dimension
+        "- Model: `{}` at `{}`, {} dimensions",
+        fixture.model.identifier, fixture.model.revision, fixture.model.dimension
     )?;
     writeln!(
         output,

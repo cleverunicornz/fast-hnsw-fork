@@ -19,7 +19,7 @@ jobs:
     # The generator verifies both; this workflow intentionally installs neither.
     env:
       CORPUS_SHA: 951dd74fd6cdbe050cb451dc9ab0448836728dbb
-      SEMBLE_MODEL_NAME: minishlab/potion-code-16M-v2
+      SEMBLE_MODEL_NAME: /opt/paseo-semantic-index/semble/models/e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b
       HF_HUB_OFFLINE: "1"
       PYTHONHASHSEED: "0"
       SEMBLE_HNSW_REQUIRE_CLEAN: "1"

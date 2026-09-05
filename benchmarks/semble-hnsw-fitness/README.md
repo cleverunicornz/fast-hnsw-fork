@@ -8,7 +8,8 @@ change Semble's embedding model, or add Semble-specific types to the
 
 - Semble: `cleverunicornz/semble@v0.7.1`, peeled commit
   `21d885145c8724b94122fa0718988b0c7bf8e902`.
-- Model: `minishlab/potion-code-16M-v2`, 256 dimensions.
+- Model: `minishlab/potion-code-16M-v2` at revision
+  `e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b`, 256 dimensions.
 - Corpus: `cleverunicornz/yeet-code` commit
   `951dd74fd6cdbe050cb451dc9ab0448836728dbb`.
 - Queries: the 36 grounded definitions in `queries.json`, copied byte-for-byte
@@ -27,7 +28,7 @@ The `cvu-agent-code-x64` image is intentionally required to pre-provision that
 Semble release and the pinned model snapshot. The workflow does not install or
 download either one and sets `HF_HUB_OFFLINE=1`; fixture generation is the
 authoritative enforcement point for distribution version, owned source hashes,
-model name, model dimension, and model-output identity.
+model revision and file hashes, model dimension, and model-output identity.
 
 ## Controls
 

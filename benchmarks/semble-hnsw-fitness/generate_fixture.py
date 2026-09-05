@@ -33,6 +33,13 @@ SEMBLE_TAG = "v0.7.1"
 SEMBLE_GIT_SHA = "21d885145c8724b94122fa0718988b0c7bf8e902"
 SEMBLE_VERSION = "0.7.1"
 MODEL_IDENTIFIER = "minishlab/potion-code-16M-v2"
+MODEL_REVISION = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b"
+MODEL_FILE_HASHES = {
+    "config.json": "148e5691a6fcc553437156859701fba017a1ba5d340b170f17e0f3668fb861a7",
+    "modules.json": "a68dcbed0429dcdd5bfdca92b0b03cc30d09122c0a3fcf4758787d4b244e45b2",
+    "tokenizer.json": "107bbdcbad4bff1d299b7a4c3a2fb17c52890688b7dd0e4c9deab79d3c4f3d45",
+    "model.safetensors": "75cf7a6c2171b230ad19b1e7d8e0b1aee86da5a02af8e7cacedd9921d227623c",
+}
 MODEL_DIMENSION = 256
 CORPUS_REPOSITORY = "cleverunicornz/yeet-code"
 CORPUS_GIT_SHA = "951dd74fd6cdbe050cb451dc9ab0448836728dbb"
@@ -137,6 +144,38 @@ def verify_installed_semble() -> dict[str, str]:
     if problems:
         fail("installed Semble source drift: " + "; ".join(problems))
     return observed
+
+
+def verify_model_source(configured_model: str) -> tuple[Path, dict[str, str]]:
+    if configured_model == MODEL_IDENTIFIER:
+        from huggingface_hub import snapshot_download
+
+        model_root = Path(
+            snapshot_download(
+                MODEL_IDENTIFIER,
+                revision=MODEL_REVISION,
+                local_files_only=True,
+            )
+        ).resolve()
+    else:
+        model_root = Path(configured_model).resolve()
+    if not model_root.is_dir():
+        fail(f"pinned model directory is unavailable: {model_root}")
+
+    observed: dict[str, str] = {}
+    problems: list[str] = []
+    for relative, expected in MODEL_FILE_HASHES.items():
+        source = model_root / relative
+        if not source.is_file():
+            problems.append(f"{relative}: missing")
+            continue
+        actual = sha256_bytes(source.read_bytes())
+        observed[relative] = actual
+        if actual != expected:
+            problems.append(f"{relative}: expected {expected}, found {actual}")
+    if problems:
+        fail("installed model source drift: " + "; ".join(problems))
+    return model_root, observed
 
 
 def verify_queries(path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -359,15 +398,12 @@ def main() -> None:
     if os.environ.get("PYTHONHASHSEED") != "0":
         fail("PYTHONHASHSEED must be exactly 0 for deterministic Semble tie behavior")
     configured_model = os.environ.get("SEMBLE_MODEL_NAME", MODEL_IDENTIFIER)
-    if configured_model != MODEL_IDENTIFIER:
-        fail(
-            f"SEMBLE_MODEL_NAME drift: expected {MODEL_IDENTIFIER}, found {configured_model}"
-        )
     if os.environ.get("HF_HUB_OFFLINE") != "1":
         fail("HF_HUB_OFFLINE must be 1 so the pinned runner model cannot be replaced")
 
     total_started = time.perf_counter_ns()
     observed_source_hashes = verify_installed_semble()
+    model_root, observed_model_hashes = verify_model_source(configured_model)
 
     from semble.index.create import create_index_from_path
     from semble.index.dense import SelectableBasicBackend, load_model
@@ -407,9 +443,9 @@ def main() -> None:
     query_definitions, query_digest = verify_queries(queries_path)
     corpus_identity, corpus_hash_us = timed(lambda: verify_corpus(corpus))
 
-    (model, resolved_model), model_load_us = timed(lambda: load_model(MODEL_IDENTIFIER))
-    if resolved_model != MODEL_IDENTIFIER:
-        fail(f"Semble resolved a different model: {resolved_model}")
+    (model, resolved_model), model_load_us = timed(lambda: load_model(str(model_root)))
+    if Path(resolved_model).resolve() != model_root:
+        fail(f"Semble resolved a different model path: {resolved_model}")
     if int(model.dim) != MODEL_DIMENSION:
         fail(f"model dimension drift: expected {MODEL_DIMENSION}, found {model.dim}")
 
@@ -706,6 +742,8 @@ def main() -> None:
         },
         "model": {
             "identifier": MODEL_IDENTIFIER,
+            "revision": MODEL_REVISION,
+            "source_hashes": observed_model_hashes,
             "dimension": MODEL_DIMENSION,
             "vector_dtype": "float32-le",
             "probe_sha256": probe_sha256,
@@ -722,7 +760,9 @@ def main() -> None:
                 observed_source_hashes == SEMBLE_SOURCE_HASHES
             ),
             "model_identity_verified": (
-                resolved_model == MODEL_IDENTIFIER and int(model.dim) == MODEL_DIMENSION
+                Path(resolved_model).resolve() == model_root
+                and observed_model_hashes == MODEL_FILE_HASHES
+                and int(model.dim) == MODEL_DIMENSION
             ),
             "corpus_identity_verified": (
                 corpus_identity["git_sha"] == CORPUS_GIT_SHA
@@ -787,6 +827,7 @@ def main() -> None:
             "python": platform.python_version(),
             "python_implementation": platform.python_implementation(),
             "semble_distribution": distribution_version,
+            "model_source": "verified-local-directory",
             "numpy": np.__version__,
             "vicinity": importlib.metadata.version("vicinity"),
             "orjson": importlib.metadata.version("orjson"),

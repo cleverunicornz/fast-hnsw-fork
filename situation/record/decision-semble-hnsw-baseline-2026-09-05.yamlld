@@ -1,0 +1,84 @@
+# Decision record: filtered HNSW fitness for Semble immutable baselines.
+"@context": "urn:bedrock:context/v1"
+"@id": "urn:fast-hnsw:decision/semble-baseline-2026-09-05"
+"@type": "urn:bedrock:ontology/Decision"
+label: "Retain qualified HNSW, keep exact dense search for current Semble scale"
+timestamp: "2026-09-05T13:40:31Z"
+status: "concluded-not-adopted"
+promise: >
+  Determine whether filtered fast-hnsw should replace exact brute-force dense
+  retrieval for Semble immutable baselines on the production four-vCPU,
+  32-GiB r3-32 automation runner while holding the model, vectors, BM25, RRF,
+  reranking, corpus, and query set constant.
+witness:
+  source_commit: "f3495ed3bf8d31d913e9253a2c6b98c9cc9d2e63"
+  workflow_run: "https://github.com/cleverunicornz/fast-hnsw-fork/actions/runs/33968367481"
+  actions_artifact_id: 9970321683
+  actions_artifact_expires: "2026-10-05T13:27:17Z"
+  corpus:
+    repository: "cleverunicornz/yeet-code"
+    revision: "951dd74fd6cdbe050cb451dc9ab0448836728dbb"
+    indexed_files: 4499
+    chunks: 148472
+  model:
+    repository: "minishlab/potion-code-16M-v2"
+    revision: "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b"
+    dimensions: 256
+  queries:
+    count: 36
+    fixture_sha256: "0c94e0d1995fd40e03c8cb6ef1835667f959748acf81fa3854fc6d9f9c26f89d"
+  runner:
+    profile: "cvu-agent-code-x64"
+    shape: "r3-32"
+    vcpus: 4
+    memory_visible_bytes: 32858210304
+    hourly_gbp_ex_vat: 0.1139
+  measurements:
+    semble_index_build_ms: 126964.305966
+    exact_dense_median_ms: 4.559547
+    bm25_median_ms: 33.998579
+    hybrid_control_median_ms: 56.689329
+    hnsw_four_worker_build_ms: 46980.512977
+    hnsw_ef400_dense_median_ms: 0.538091
+    hnsw_artifact_bytes: 193032024
+    hnsw_child_peak_rss_bytes: 645218304
+    hnsw_ef400_dense_recall_at_1: 1.0
+    hnsw_ef400_dense_recall_at_5: 1.0
+    hnsw_ef400_dense_recall_at_10: 0.9944444444444444
+    shadow_10_recall_at_10: 0.9944444444444444
+    shadow_50_recall_at_10: 0.9916666666666666
+    shadowed_results_emitted: 0
+oracle:
+  verdict: "pass"
+  statement: >
+    Independent read-only review recomputed exact cosine from fixture bytes for
+    all 36 queries, parsed and hashed all four compact graph artifacts, verified
+    that every graph contained the identical vector bytes, recomputed all twelve
+    receipt gates, and found no result-invalidating defect.
+decision: >
+  Keep exact brute-force dense retrieval as the immediate Semble baseline
+  default. HNSW reduced the measured dense component from 4.560 ms to 0.538 ms
+  at ef=400, but added 46.981 seconds to a cold four-worker baseline and removed
+  only about four milliseconds from a 56.689-ms hybrid query. A fresh graph
+  would require roughly 11,700 searches to amortize its construction cost.
+  Retain the merged harness and manual workflow because HNSW is technically
+  qualified for larger or extensively reused baselines.
+revisit_when:
+  - "A baseline approaches or exceeds one million vectors."
+  - "Exact dense p95 materially consumes the semantic-search latency budget."
+  - "One commit-keyed graph can be reused across enough jobs to amortize construction."
+  - "A unified multi-repository index is proposed."
+  - "Concurrent exact scans create measured memory-bandwidth pressure."
+  - "A new builder materially reduces complete HNSW construction time."
+residual: >
+  The witness covers one r3-32 execution and one static corpus. Parallel graph
+  edge order is scheduler-dependent. HNSW latency was warmed Rust mmap search,
+  while the exact-dense control was single-shot Python/NumPy; reported speedup
+  is therefore component-scale evidence, not an end-to-end latency claim. The
+  experiment did not exercise live delta ingestion.
+references:
+  - "https://github.com/cleverunicornz/fast-hnsw-fork/pull/2"
+  - "https://github.com/cleverunicornz/fast-hnsw-fork/pull/3"
+  - "https://github.com/cleverunicornz/fast-hnsw-fork/pull/8"
+  - "benchmarks/semble-hnsw-fitness/README.md"
+  - ".github/workflows/semble-hnsw-fitness.yml"

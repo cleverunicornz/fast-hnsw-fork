@@ -633,6 +633,8 @@ separately generated, version-gated fixture. See the
 [Semble / HNSW fitness benchmark](benchmarks/semble-hnsw-fitness/README.md)
 for its exact corpus, controls, metrics, and manual workflow. It does not alter
 the library API or Semble's production search path.
+The concluded current-scale adoption decision and retained witness are recorded
+in [`situation/record/decision-semble-hnsw-baseline-2026-09-05.yamlld`](situation/record/decision-semble-hnsw-baseline-2026-09-05.yamlld).
 
 ```bash
 cargo build --release

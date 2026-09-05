@@ -13,6 +13,7 @@ pub const EXPECTED_SEMBLE_REPOSITORY: &str = "cleverunicornz/semble";
 pub const EXPECTED_SEMBLE_TAG: &str = "v0.7.1";
 pub const EXPECTED_SEMBLE_SHA: &str = "21d885145c8724b94122fa0718988b0c7bf8e902";
 pub const EXPECTED_MODEL: &str = "minishlab/potion-code-16M-v2";
+pub const EXPECTED_MODEL_REVISION: &str = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b";
 pub const EXPECTED_DIMENSION: usize = 256;
 pub const EXPECTED_CORPUS_REPOSITORY: &str = "cleverunicornz/yeet-code";
 pub const EXPECTED_CORPUS_SHA: &str = "951dd74fd6cdbe050cb451dc9ab0448836728dbb";
@@ -51,6 +52,8 @@ pub struct GeneratorIdentity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelIdentity {
     pub identifier: String,
+    pub revision: String,
+    pub source_hashes: BTreeMap<String, String>,
     pub dimension: usize,
     pub vector_dtype: String,
     pub probe_sha256: String,
@@ -282,6 +285,17 @@ pub fn validate_fixture(fixture: &Fixture) -> io::Result<()> {
     require(
         fixture.model.identifier == EXPECTED_MODEL,
         "fixture embedding model drifted",
+    )?;
+    require(
+        fixture.model.revision == EXPECTED_MODEL_REVISION,
+        "fixture embedding model revision drifted",
+    )?;
+    require(
+        fixture.model.source_hashes.len() == 4
+            && fixture.model.source_hashes.values().all(|hash| {
+                hash.len() == 64 && hash.chars().all(|character| character.is_ascii_hexdigit())
+            }),
+        "fixture embedding model source hashes are incomplete",
     )?;
     require(
         fixture.model.dimension == EXPECTED_DIMENSION,
@@ -1086,6 +1100,10 @@ mod tests {
             },
             model: ModelIdentity {
                 identifier: EXPECTED_MODEL.into(),
+                revision: EXPECTED_MODEL_REVISION.into(),
+                source_hashes: (0..4)
+                    .map(|index| (format!("model-{index}"), "d".repeat(64)))
+                    .collect(),
                 dimension: 2,
                 vector_dtype: "float32-le".into(),
                 probe_sha256: "e".repeat(64),

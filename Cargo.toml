@@ -1,7 +1,8 @@
 [package]
 name = "fast-hnsw"
-version = "1.0.1"
+version = "2.0.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Pure-Rust implementation of Hierarchical Navigable Small World (HNSW) approximate nearest-neighbour search"
 authors = ["Nataliya Kosmyna <nkosmyna@mit.edu>"]
 license = "MIT"
@@ -12,12 +13,45 @@ exclude = [
     "/figures/*"
 ]
 
+[workspace]
+members = ["quantized"]
+resolver = "2"
+
+[features]
+default = ["simd"]
+# Hand-written NEON / AVX2 distance kernels. On by default; disabling falls
+# back to the portable folds, which LLVM still auto-vectorises.
+simd = []
+# AVX-512 kernels, runtime-detected. Off by default because the intrinsics
+# require Rust 1.89, above this crate's declared 1.85 MSRV; enabling it raises
+# your effective minimum. Safe to enable and run on non-AVX-512 CPUs -- the
+# dispatch falls back to AVX2 or the portable fold.
+avx512 = ["simd"]
+# Serde derives on the crate's small data types (Config, SearchResult,
+# IndexStats, ...). Indexes themselves are NOT serde-serialisable -- see the
+# crate docs for why `persist` is the right tool for those.
+serde = ["dep:serde"]
+# Multi-threaded index construction via `Builder::build_parallel`.
+parallel = ["dep:rayon"]
+# Route DotProduct/Cosine through a BLAS already installed on the system.
+# Nothing is vendored, downloaded, or built: `build.rs` only emits a link
+# directive. Apple targets resolve to the Accelerate framework automatically;
+# elsewhere pkg-config is consulted, and FAST_HNSW_BLAS_LIB overrides both.
+blas = []
+
 [dependencies]
 rand     = "0.10"
-memmap2  = "0.9"   # pure-Rust mmap wrapper; zero C/C++ deps
+memmap2  = "0.9.11"   # pure-Rust mmap wrapper; zero C/C++ deps
+rayon    = { version = "1.10", optional = true }
+serde    = { version = "1", optional = true, features = ["derive"] }
 
 [dev-dependencies]
-rand        = "0.10"
+tempfile    = "3.20"
+serde_json  = "1"
+hnsw_rs     = "0.3.4"
+hnsw_ext    = { package = "hnsw", version = "0.11.0" }   # rust-cv / Geordon Worley
+rand_pcg    = "0.3"                                       # rand_core 0.6 RNG required by hnsw_ext
+space       = { version = "0.17", default-features = false, features = ["alloc"] } # Metric trait
 
 [[bench]]
 name  = "bench"
@@ -25,8 +59,23 @@ path  = "benches/bench.rs"
 harness = false
 
 [[bench]]
+name  = "compare"
+path  = "benches/compare.rs"
+harness = false
+
+[[bench]]
 name  = "persist"
 path  = "benches/persist.rs"
+harness = false
+
+[[bench]]
+name = "fvecs"
+path = "benches/fvecs.rs"
+harness = false
+
+[[bench]]
+name = "mmap_fvecs"
+path = "benches/mmap_fvecs.rs"
 harness = false
 
 [[example]]
@@ -36,3 +85,8 @@ path = "examples/demo.rs"
 [[example]]
 name = "store"
 path = "examples/store.rs"
+
+# Every feature now builds together (no conflicting BLAS backends, and `blas`
+# needs no library present to *document*), so docs.rs can use all of them.
+[package.metadata.docs.rs]
+all-features = true

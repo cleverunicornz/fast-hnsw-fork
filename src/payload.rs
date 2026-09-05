@@ -1,5 +1,6 @@
-//! Typed payload stored alongside each vector in a [`LabeledIndex`] or
-//! [`PairedIndex`].
+//! Typed payload stored alongside each vector in a
+//! [`LabeledIndex`](crate::labeled::LabeledIndex) or
+//! [`PairedIndex`](crate::paired::PairedIndex).
 //!
 //! # Implementing `Payload`
 //!

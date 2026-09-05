@@ -1,0 +1,28 @@
+[package]
+name = "fast-hnsw-quantized"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Versioned mmap-native low-bit vector sidecars with optional fast-hnsw traversal"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/nataliyakosmyna/fast-hnsw"
+keywords = ["hnsw", "vector", "quantization", "mmap", "ann"]
+categories = ["algorithms", "data-structures", "science"]
+
+[features]
+default = ["hnsw"]
+hnsw = ["dep:fast-hnsw"]
+
+[dependencies]
+crc32fast = "1.5"
+memmap2 = "0.9.11"
+fast-hnsw = { path = "..", version = "2.0.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[[bench]]
+name = "quantized"
+path = "benches/quantized.rs"
+harness = false

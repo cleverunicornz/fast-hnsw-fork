@@ -44,10 +44,10 @@ CANDIDATE_MULTIPLIER = 5
 DIRECT_COSINE_SCORE_TOLERANCE = 5e-4
 CANDIDATE_COUNT = TOP_K * CANDIDATE_MULTIPLIER
 
-# These hashes bind installed code to cleverunicornz/semble@v0.7.0. They are
-# hashes of the raw files at SEMBLE_GIT_SHA, not hashes from upstream MinishLab.
+# These hashes bind every behavior-bearing installed module used by the
+# benchmark to cleverunicornz/semble@v0.7.0. Runtime and distribution versions
+# are enforced separately because packaged version.py generation may differ.
 SEMBLE_SOURCE_HASHES = {
-    "version.py": "881b9935aea9e8846157519a516acc4b706910e6d75fb2a2e117bf93a8cb4d88",
     "index/dense.py": "cadaecf677186892665765a772b873580ff3fda8b8519b1ca76f4f665460f460",
     "index/create.py": "0b7a987baf70797545006eec743620f3a9324b576bc3ddb4882cb35056746b3b",
     "index/index.py": "b8f586cd184edeac79ae82d2eff8a9500f809fa86f088b944ea170a196fb51c2",
